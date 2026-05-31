@@ -1,0 +1,23 @@
+[app]
+timezone = "Asia/Shanghai"
+demo_mode = false
+ignore_env_proxy = true
+
+[database]
+path = "data/app.db"
+
+[scan]
+pool_refresh_seconds = 60
+signal_scan_seconds = 30
+monitor_pool_size = 100
+focus_pool_size = 30
+
+[market]
+exclude_st = true
+exclude_etf = true
+exclude_convertible = true
+enable_bj = false
+
+[alert]
+default_cooldown_minutes = 20
+enable_console = true

@@ -1,0 +1,14 @@
+[double_bottom]
+lookback_minutes = 120
+min_required_bars = 40
+min_gap_minutes = 20
+max_low_diff_ratio = 0.015
+min_rebound_ratio = 0.02
+near_breakout_ratio = 0.003
+breakout_ratio = 0.0
+cooldown_minutes = 20
+
+[momentum_probe]
+enabled = true
+min_pct_chg = 3.0
+cooldown_minutes = 10
