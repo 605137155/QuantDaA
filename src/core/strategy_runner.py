@@ -59,6 +59,9 @@ class StrategyRunner:
             self.minute_repo.replace_for_stock(stock_code, minute_bars)
         return self.minute_repo.get_recent(stock_code, limit=limit)
 
+    def get_cached_minute_bars(self, stock_code: str, limit: int = 240) -> list:
+        return self.minute_repo.get_recent(stock_code, limit=limit)
+
     @staticmethod
     def _to_watch_item(signal, snapshot) -> WatchItem:
         return WatchItem(

@@ -4,6 +4,8 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Optional
 
+from src.data_providers.ths_hot_provider import THSHotProvider
+
 
 def launch_desktop_app(app_runner) -> None:
     root = tk.Tk()
@@ -20,11 +22,30 @@ class QuantDaAMainWindow:
         self.monitor_rows: list = []
         self.signal_rows: list = []
         self.rank_mode = tk.StringVar(value="monitor")
+        self.review_date_var = tk.StringVar(value="")
+        self.review_trade_date = ""
+        self.review_date_combo = None
         self.current_detail = None
+        self.current_candidate_map: dict[str, dict] = {}
         self.hover_stock_code = ""
+        self.hover_item_id = ""
+        self._pending_hover_code = ""
+        self._hover_preview_job = None
+        self._hover_preview_delay_ms = 180
         self._refresh_job = None
         self._scan_job = None
         self.popup_notifier = None
+
+        # 同花顺热门榜单数据
+        self.ths_provider = THSHotProvider()
+        self.ths_hourly_hot: list = []  # 24小时热榜
+        self.ths_value_hot: list = []   # 价值投资热榜
+        self._ths_refresh_job = None  # 同花顺定时刷新任务
+        # 从配置文件读取刷新间隔，默认60秒
+        ths_refresh_seconds = self.app_runner.settings.get("hot_score", {}).get("ths_refresh_seconds", 60)
+        self._ths_base_interval = int(ths_refresh_seconds) * 1000  # 基础间隔（毫秒）
+        self._ths_random_range = 10000  # 随机范围±10秒（毫秒）
+        self._ths_last_update = ""  # 上次更新时间
 
         self.root.title("QuantDaA 热门股监控")
         self._configure_window_size()
@@ -120,13 +141,40 @@ class QuantDaAMainWindow:
 
         rank_bar = tk.Frame(rank_frame, bg="#ffffff")
         rank_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        tk.Label(rank_bar, text="排行视图", bg="#ffffff", fg="#344054").pack(side="left")
-        ttk.Radiobutton(rank_bar, text="成交额前100", value="monitor", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
-            side="left", padx=(12, 4)
+        rank_bar.grid_columnconfigure(0, weight=1)
+        tk.Label(rank_bar, text="排行视图", bg="#ffffff", fg="#344054").grid(row=0, column=0, sticky="w")
+
+        rank_row1 = tk.Frame(rank_bar, bg="#ffffff")
+        rank_row1.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Radiobutton(rank_row1, text="成交额前100", value="monitor", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
+            side="left", padx=(0, 4)
         )
-        ttk.Radiobutton(rank_bar, text="重点池", value="focus", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
+        ttk.Radiobutton(rank_row1, text="重点池", value="focus", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
             side="left", padx=4
         )
+        ttk.Radiobutton(rank_row1, text="同花顺24小时热榜", value="ths_hourly", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
+            side="left", padx=4
+        )
+
+        rank_row2 = tk.Frame(rank_bar, bg="#ffffff")
+        rank_row2.grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(4, 0))
+        ttk.Radiobutton(rank_row2, text="同花顺价值投资", value="ths_value", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Radiobutton(rank_row2, text="复盘候选", value="replay_candidate", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
+            side="left", padx=4
+        )
+        ttk.Radiobutton(rank_row2, text="盘中候选", value="intraday_candidate", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
+            side="left", padx=4
+        )
+
+        review_row = tk.Frame(rank_bar, bg="#ffffff")
+        review_row.grid(row=2, column=1, sticky="w", padx=(12, 0), pady=(6, 0))
+        tk.Label(review_row, text="回看日期", bg="#ffffff", fg="#344054").pack(side="left", padx=(0, 6))
+        self.review_date_combo = ttk.Combobox(review_row, textvariable=self.review_date_var, width=16, state="disabled")
+        self.review_date_combo.pack(side="left", padx=(0, 6))
+        self.review_date_combo.bind("<<ComboboxSelected>>", self._on_review_date_selected)
+        ttk.Button(review_row, text="清除", command=self._clear_review_date, width=5).pack(side="left")
 
         self.hot_tree = ttk.Treeview(
             rank_frame,
@@ -296,21 +344,42 @@ class QuantDaAMainWindow:
         self.signal_rows = self.app_runner.scan_once()
         self._refresh_hot_tree()
         self._refresh_signal_tree()
+        self.app_runner.save_daily_snapshots_if_needed(
+            ths_hourly_rows=self.ths_hourly_hot,
+            ths_value_rows=self.ths_value_hot,
+        )
         if self.monitor_rows:
-            self._select_stock(self.monitor_rows[0].code)
+            self._select_stock(self._row_code(self.monitor_rows[0]))
         self._update_status("初始化完成")
 
     def _schedule_jobs(self) -> None:
-        pool_ms = int(self.app_runner.settings["scan"]["pool_refresh_seconds"] * 1000)
+        pool_ms = self.app_runner.get_next_pool_refresh_delay_ms()
         scan_ms = int(self.app_runner.settings["scan"]["signal_scan_seconds"] * 1000)
         self._refresh_job = self.root.after(pool_ms, self._refresh_cycle)
         self._scan_job = self.root.after(scan_ms, self._scan_cycle)
 
+        # 启动同花顺数据定时刷新（首次延迟8-12秒后执行，避免启动时卡顿）
+        import random
+        first_delay = random.randint(8000, 12000)
+        self._ths_refresh_job = self.root.after(first_delay, self._refresh_ths_cycle)
+
     def _refresh_cycle(self) -> None:
-        self.app_runner.refresh_pools()
-        self._refresh_hot_tree()
-        self._update_status("排行榜已刷新")
-        self._refresh_job = self.root.after(int(self.app_runner.settings["scan"]["pool_refresh_seconds"] * 1000), self._refresh_cycle)
+        try:
+            self.app_runner.refresh_pools()
+            self.app_runner.save_daily_snapshots_if_needed(
+                ths_hourly_rows=self.ths_hourly_hot,
+                ths_value_rows=self.ths_value_hot,
+            )
+            self.app_runner.save_intraday_candidate_snapshots_if_needed(
+                ths_rows=self.ths_hourly_hot,
+                kpl_rows=[],
+            )
+            self._refresh_hot_tree()
+            self._update_status("排行榜已刷新")
+        except Exception as exc:
+            delay_seconds = self.app_runner.get_next_pool_refresh_delay_ms() // 1000
+            self._update_status(f"排行榜刷新失败: {exc} | {delay_seconds} 秒后重试")
+        self._refresh_job = self.root.after(self.app_runner.get_next_pool_refresh_delay_ms(), self._refresh_cycle)
 
     def _scan_cycle(self) -> None:
         new_signals = self.app_runner.scan_once()
@@ -324,15 +393,180 @@ class QuantDaAMainWindow:
             self._render_stock_detail(self.selected_stock_code)
         self._scan_job = self.root.after(int(self.app_runner.settings["scan"]["signal_scan_seconds"] * 1000), self._scan_cycle)
 
+    def _load_ths_hourly_hot(self) -> None:
+        """加载同花顺24小时热榜"""
+        try:
+            self.ths_hourly_hot = self.ths_provider.get_24h_hot(limit=100)
+        except Exception as e:
+            print(f"[THS] 加载24小时热榜失败: {e}")
+            self.ths_hourly_hot = []
+
+    def _load_ths_value_hot(self) -> None:
+        """加载同花顺价值投资热榜"""
+        try:
+            self.ths_value_hot = self.ths_provider.get_hot_stocks(
+                time_type="day",
+                list_type="value",
+                limit=100
+            )
+        except Exception as e:
+            print(f"[THS] 加载价值投资热榜失败: {e}")
+            self.ths_value_hot = []
+
+    def _get_ths_refresh_interval(self) -> int:
+        """获取带随机延时的刷新间隔（毫秒）"""
+        import random
+        # 基础间隔 ± 随机范围
+        random_offset = random.randint(-self._ths_random_range, self._ths_random_range)
+        interval = max(30000, self._ths_base_interval + random_offset)  # 最少30秒
+        return interval
+
+    def _refresh_ths_cycle(self) -> None:
+        """定时刷新同花顺热门榜单数据"""
+        try:
+            from datetime import datetime
+            current_time = datetime.now().strftime("%H:%M:%S")
+
+            # 刷新数据
+            self._load_ths_hourly_hot()
+            self._load_ths_value_hot()
+            self._ths_last_update = current_time
+
+            self.app_runner.save_daily_snapshots_if_needed(
+                ths_hourly_rows=self.ths_hourly_hot,
+                ths_value_rows=self.ths_value_hot,
+            )
+            # 如果当前正在查看同花顺或候选排行榜，刷新UI显示
+            if self.rank_mode.get() in ("ths_hourly", "ths_value", "replay_candidate", "intraday_candidate"):
+                self._refresh_hot_tree()
+
+            print(f"[THS] 同花顺热榜数据已更新: {current_time} (24h:{len(self.ths_hourly_hot)}只, 价值:{len(self.ths_value_hot)}只)")
+
+        except Exception as e:
+            print(f"[THS] 定时刷新失败: {e}")
+
+        # 设置下次刷新任务（带随机延时）
+        next_interval = self._get_ths_refresh_interval()
+        self._ths_refresh_job = self.root.after(next_interval, self._refresh_ths_cycle)
+
     def _refresh_hot_tree(self) -> None:
         current = self.selected_stock_code
-        self.monitor_rows = list(self.app_runner.state.focus_pool if self.rank_mode.get() == "focus" else self.app_runner.state.monitor_pool)
+        mode = self.rank_mode.get()
+        self.current_candidate_map = {}
+        review_enabled = bool(self.review_trade_date and mode in ("replay_candidate", "intraday_candidate"))
+        self._update_hot_tree_columns(mode, review_enabled)
+        self._refresh_review_date_options(mode)
+
+        if mode == "ths_hourly":
+            # 同花顺24小时热榜（使用缓存数据，不重复请求）
+            self.monitor_rows = self.ths_hourly_hot
+        elif mode == "ths_value":
+            # 同花顺价值投资热榜（使用缓存数据，不重复请求）
+            self.monitor_rows = self.ths_value_hot
+        elif mode == "replay_candidate":
+            if self.review_trade_date:
+                self.monitor_rows = self.app_runner.get_candidate_review_rows("replay", self.review_trade_date)
+            else:
+                self.monitor_rows = self.app_runner.build_replay_candidate_ranking()
+            self.current_candidate_map = {row["stock_code"]: row for row in self.monitor_rows}
+        elif mode == "intraday_candidate":
+            if self.review_trade_date:
+                self.monitor_rows = self.app_runner.get_candidate_review_rows("intraday", self.review_trade_date)
+            else:
+                self.monitor_rows = self.app_runner.build_intraday_candidate_ranking(ths_rows=self.ths_hourly_hot, kpl_rows=[])
+            self.current_candidate_map = {row["stock_code"]: row for row in self.monitor_rows}
+        else:
+            self.monitor_rows = list(self.app_runner.state.focus_pool if mode == "focus" else self.app_runner.state.monitor_pool)
+
         self.hot_tree.delete(*self.hot_tree.get_children())
         for idx, row in enumerate(self.monitor_rows, start=1):
-            amount_text = f"{row.amount / 100000000:.2f}亿"
-            item_id = self.hot_tree.insert("", "end", values=(idx, row.code, row.name, f"{row.pct_chg:.2f}", amount_text), tags=())
-            if row.code == current:
+            if mode in ("replay_candidate", "intraday_candidate"):
+                tags_text = "、".join(row["flags"][:2]) if row["flags"] else "-"
+                if self.review_trade_date:
+                    perf_text = self._format_candidate_forward_perf(row)
+                    amount_value = f"{row['grade']} | {perf_text}"
+                else:
+                    amount_value = f"{row['grade']} | {tags_text}"
+                item_id = self.hot_tree.insert(
+                    "",
+                    "end",
+                    values=(idx, row["stock_code"], row["stock_name"], f"{row['total_score']}", amount_value),
+                    tags=(),
+                )
+            elif mode in ("ths_hourly", "ths_value"):
+                # 同花顺数据格式
+                amount_text = f"热度:{row.rate:.0f}"
+                pct_text = f"{row.rise_and_fall:.2f}"
+                item_id = self.hot_tree.insert("", "end", values=(idx, row.code, row.name, pct_text, amount_text), tags=())
+            else:
+                # 原有数据格式
+                amount_text = f"{row.amount / 100000000:.2f}亿"
+                item_id = self.hot_tree.insert("", "end", values=(idx, row.code, row.name, f"{row.pct_chg:.2f}", amount_text), tags=())
+
+            if self._row_code(row) == current:
                 self.hot_tree.selection_set(item_id)
+
+    def _update_hot_tree_columns(self, mode: str, review_enabled: bool = False) -> None:
+        if mode in ("replay_candidate", "intraday_candidate"):
+            self.hot_tree.heading("pct", text="候选评分")
+            self.hot_tree.heading("amount", text="等级/次日涨幅" if review_enabled else "等级/标签")
+            self.hot_tree.column("pct", width=80, anchor="center")
+            self.hot_tree.column("amount", width=170 if review_enabled else 150, anchor="center")
+            return
+
+        self.hot_tree.heading("pct", text="涨幅%")
+        self.hot_tree.heading("amount", text="成交额")
+        self.hot_tree.column("pct", width=70, anchor="center")
+        self.hot_tree.column("amount", width=120, anchor="center")
+
+    @staticmethod
+    def _row_code(row) -> str:
+        if isinstance(row, dict):
+            return row.get("stock_code") or row.get("code", "")
+        return getattr(row, "code", "")
+
+    def _load_review_date(self) -> None:
+        self.review_trade_date = self.review_date_var.get().strip()
+        self._refresh_hot_tree()
+        if self.monitor_rows:
+            self._select_stock(self._row_code(self.monitor_rows[0]))
+        else:
+            self._update_status(f"未找到 {self.review_trade_date} 的候选历史")
+
+    def _on_review_date_selected(self, _event=None) -> None:
+        self._load_review_date()
+
+    def _clear_review_date(self) -> None:
+        self.review_trade_date = ""
+        self.review_date_var.set("")
+        self._refresh_hot_tree()
+        if self.monitor_rows:
+            self._select_stock(self._row_code(self.monitor_rows[0]))
+
+    def _refresh_review_date_options(self, mode: str) -> None:
+        if self.review_date_combo is None:
+            return
+        if mode == "replay_candidate":
+            dates = self.app_runner.get_candidate_review_dates("replay")
+            self.review_date_combo.configure(state="readonly" if dates else "normal")
+            self.review_date_combo["values"] = dates
+            return
+        if mode == "intraday_candidate":
+            dates = self.app_runner.get_candidate_review_dates("intraday")
+            self.review_date_combo.configure(state="readonly" if dates else "normal")
+            self.review_date_combo["values"] = dates
+            return
+
+        self.review_date_combo["values"] = []
+        self.review_date_combo.configure(state="disabled")
+
+    @staticmethod
+    def _format_candidate_forward_perf(row: dict) -> str:
+        next_day_pct = row.get("next_day_pct")
+        if next_day_pct is None:
+            return "待观察"
+        prefix = "当前" if row.get("next_day_mode") == "current" else "次日"
+        return f"{prefix}{next_day_pct:+.2f}%"
 
     def _refresh_signal_tree(self) -> None:
         self.signal_tree.delete(*self.signal_tree.get_children())
@@ -350,23 +584,28 @@ class QuantDaAMainWindow:
         item_id = self.hot_tree.identify_row(event.y)
         if not item_id:
             return
-        for existing in self.hot_tree.get_children():
-            self.hot_tree.item(existing, tags=())
-        self.hot_tree.item(item_id, tags=("hover",))
+        self._set_hover_item(item_id)
         values = self.hot_tree.item(item_id, "values")
         if not values:
             return
         code = values[1]
-        if code == self.hover_stock_code:
+        if code == self._pending_hover_code:
             return
-        self.hover_stock_code = code
-        self._render_stock_detail(code, preview_only=True)
+        if code == self.hover_stock_code and self._hover_preview_job is None:
+            return
+        self._cancel_hover_preview()
+        self._pending_hover_code = code
+        self._hover_preview_job = self.root.after(
+            self._hover_preview_delay_ms,
+            lambda stock_code=code: self._apply_hover_preview(stock_code),
+        )
 
     def _on_hot_tree_leave(self, _event) -> None:
+        had_preview = bool(self.hover_stock_code)
+        self._cancel_hover_preview()
         self.hover_stock_code = ""
-        for existing in self.hot_tree.get_children():
-            self.hot_tree.item(existing, tags=())
-        if self.selected_stock_code:
+        self._set_hover_item("")
+        if had_preview and self.selected_stock_code:
             self._render_stock_detail(self.selected_stock_code, preview_only=False)
 
     def _on_signal_tree_select(self, _event) -> None:
@@ -382,6 +621,8 @@ class QuantDaAMainWindow:
             self.reason_text.insert("1.0", "\n".join(signal.reasons))
 
     def _select_stock(self, code: str) -> None:
+        self._cancel_hover_preview()
+        self.hover_stock_code = ""
         self.selected_stock_code = code
         self.selected_daily_date = ""
         self._render_stock_detail(code, preview_only=False)
@@ -402,20 +643,40 @@ class QuantDaAMainWindow:
 
     def _render_stock_detail(self, code: str, preview_only: bool = False) -> None:
         target_date = "" if preview_only and code != self.selected_stock_code else self.selected_daily_date
-        detail = self.app_runner.get_stock_detail(code, target_date)
+        if preview_only:
+            detail = self.app_runner.get_cached_stock_detail(code, target_date)
+        else:
+            detail = self.app_runner.get_stock_detail(code, target_date)
         self.current_detail = detail
         snapshot = detail["snapshot"]
         if not preview_only:
             self.selected_daily_date = detail["selected_date"]
         shown_date = detail["selected_date"]
         available_dates = detail["available_minute_dates"]
-        all_minute_bars = detail["all_minute_bars"]
+        minute_bars_by_date = detail["minute_bars_by_date"]
         live_date = available_dates[-1] if available_dates else ""
-        live_bars = [item for item in all_minute_bars if item.ts[:10] == live_date] if live_date else []
+        live_bars = minute_bars_by_date.get(live_date, []) if live_date else []
+        candidate = self.current_candidate_map.get(code)
+        candidate_text = ""
+        if candidate:
+            perf_text = ""
+            if self.review_trade_date:
+                next_trade_suffix = f" ({candidate.get('next_trade_date', '')})" if candidate.get("next_trade_date") else ""
+                perf_text = (
+                    f"    表现: {self._format_candidate_forward_perf(candidate)}"
+                    f"{next_trade_suffix}"
+                )
+            candidate_text = (
+                f"\n候选评分: {candidate['total_score']} ({candidate['grade']})"
+                f"    加分: {'、'.join(candidate['flags'][:3]) if candidate['flags'] else '-'}"
+                f"    风险: {'、'.join(candidate['risks'][:2]) if candidate['risks'] else '-'}"
+                f"{perf_text}"
+            )
         self.detail_var.set(
             f"{snapshot.name} {snapshot.code}\n"
             f"最新价: {snapshot.last_price:.2f}    涨幅: {snapshot.pct_chg:.2f}%    成交额: {snapshot.amount / 100000000:.2f}亿    换手率: {snapshot.turnover_rate:.2f}%\n"
             f"最高: {snapshot.high:.2f}    最低: {snapshot.low:.2f}    实时窗口: {live_date or '无'}    复盘窗口: {shown_date or '无'}    分时日期数: {len(available_dates)}"
+            f"{candidate_text}"
         )
         selected_marker = self.selected_daily_date if not preview_only else shown_date
         self.daily_chart.render(detail["daily_bars"], selected_date=selected_marker)
@@ -441,8 +702,7 @@ class QuantDaAMainWindow:
         if not self.current_detail:
             return
         hover_date = bar.ts[:10]
-        all_minute_bars = self.current_detail["all_minute_bars"]
-        minute_bars = [item for item in all_minute_bars if item.ts[:10] == hover_date]
+        minute_bars = self.current_detail["minute_bars_by_date"].get(hover_date, [])
         self.replay_chart.render(minute_bars, selected_date=hover_date)
         available_dates = self.current_detail["available_minute_dates"]
         if minute_bars:
@@ -450,9 +710,52 @@ class QuantDaAMainWindow:
         else:
             self.replay_hint_var.set(f"{hover_date} 暂无免费分钟数据，当前仅支持最近 {len(available_dates)} 个交易日左右的分时查看。")
 
+    def _set_hover_item(self, item_id: str) -> None:
+        if item_id == self.hover_item_id:
+            return
+        if self.hover_item_id and self.hot_tree.exists(self.hover_item_id):
+            self.hot_tree.item(self.hover_item_id, tags=())
+        self.hover_item_id = item_id
+        if item_id and self.hot_tree.exists(item_id):
+            self.hot_tree.item(item_id, tags=("hover",))
+
+    def _cancel_hover_preview(self) -> None:
+        if self._hover_preview_job is not None:
+            self.root.after_cancel(self._hover_preview_job)
+            self._hover_preview_job = None
+        self._pending_hover_code = ""
+
+    def _apply_hover_preview(self, stock_code: str) -> None:
+        self._hover_preview_job = None
+        self._pending_hover_code = ""
+        if stock_code == self.selected_stock_code:
+            self.hover_stock_code = ""
+            return
+        if stock_code == self.hover_stock_code:
+            return
+        self.hover_stock_code = stock_code
+        self._render_stock_detail(stock_code, preview_only=True)
+
     def _update_status(self, prefix: str) -> None:
         mode = "回退数据" if "mock" in self.app_runner.provider_name else "真实数据"
-        suffix = f" | 数据源: {self.app_runner.provider_name} ({mode}) | 当前排行数: {len(self.app_runner.state.monitor_pool)}"
+        rank_mode_text = {
+            "monitor": "成交额前100",
+            "focus": "重点池",
+            "ths_hourly": "同花顺24h热榜",
+            "ths_value": "同花顺价值投资",
+            "replay_candidate": "复盘候选",
+            "intraday_candidate": "盘中候选",
+        }.get(self.rank_mode.get(), self.rank_mode.get())
+
+        current_count = len(self.monitor_rows)
+        suffix = f" | 数据源: {self.app_runner.provider_name} ({mode}) | 当前排行: {rank_mode_text} ({current_count}只)"
+        if self.review_trade_date and self.rank_mode.get() in ("replay_candidate", "intraday_candidate"):
+            suffix += f" | 回看日期: {self.review_trade_date}"
+
+        # 显示同花顺数据更新时间
+        if self._ths_last_update:
+            suffix += f" | 同花顺更新: {self._ths_last_update}"
+
         if self.app_runner.provider_error:
             suffix += " | 实时接口异常，已回退"
         self.status_var.set(prefix + suffix)
@@ -471,6 +774,7 @@ class SimpleLineChart:
         self._dragging = False
         self._drag_start_x = 0
         self._drag_start_view = 0
+        self._render_signature = None
 
         tk.Label(self.frame, text=title, anchor="w", bg="#ffffff", font=("Microsoft YaHei UI", 10, "bold")).pack(fill="x", padx=8, pady=(8, 0))
         self.canvas = tk.Canvas(self.frame, bg="#ffffff", height=240, highlightthickness=0)
@@ -493,10 +797,28 @@ class SimpleLineChart:
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
 
     def render(self, bars: list, selected_date: str = "") -> None:
+        bars_list = list(bars)
+        incoming_bar_keys = tuple(bar.ts for bar in bars_list)
+        current_bar_keys = tuple(bar.ts for bar in self._bars)
+        if incoming_bar_keys != current_bar_keys and bars_list:
+            next_view_size = max(10, min(self._view_size, len(bars_list)))
+            self._view_start = max(0, len(bars_list) - next_view_size)
+        render_signature = (
+            selected_date,
+            max(self.canvas.winfo_width(), 340),
+            max(self.canvas.winfo_height(), 240),
+            self._view_start,
+            self._view_size,
+            tuple((bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume) for bar in bars_list),
+        )
+        if render_signature == self._render_signature:
+            return
+        self._render_signature = render_signature
         self.canvas.delete("all")
-        self._bars = list(bars)
+        self._bars = bars_list
         self._points = []
         self._selected_date = selected_date
 
@@ -579,15 +901,83 @@ class SimpleLineChart:
             return
         idx = min(range(len(self._points)), key=lambda i: abs(self._points[i][0] - event.x))
         x, y, bar = self._points[idx]
+        amount, _pct_chg = self._resolve_display_metrics(bar)
         self._draw_crosshair(x, y)
+        self._draw_tooltip(x, y, bar)
         if self.on_hover is not None:
             self.on_hover(bar)
-        self.info_var.set(f"{bar.ts}  开:{bar.open:.2f} 高:{bar.high:.2f} 低:{bar.low:.2f} 收:{bar.close:.2f} 量:{bar.volume:.0f}")
+        self.info_var.set(
+            f"{bar.ts}  开:{bar.open:.2f} 高:{bar.high:.2f} 低:{bar.low:.2f} 收:{bar.close:.2f} 量:{bar.volume:.0f} 额:{amount / 10000:.2f}万"
+        )
 
     def _on_leave(self, _event) -> None:
         self.canvas.delete("crosshair")
+        self.canvas.delete("tooltip")
         if self._bars:
             self.info_var.set("鼠标悬停看日线，点击某天切换右侧分时，滚轮缩放")
+
+    def _draw_tooltip(self, x: float, y: float, bar) -> None:
+        """绘制浮动提示框，显示日线详细信息"""
+        self.canvas.delete("tooltip")
+        lines = self._build_tooltip_lines(bar)
+        box_width = 175
+        box_height = 110
+        canvas_width = max(self.canvas.winfo_width(), 340)
+        canvas_height = max(self.canvas.winfo_height(), 240)
+        box_x = x + 14
+        box_y = y - box_height - 10
+        if box_x + box_width > canvas_width - 8:
+            box_x = x - box_width - 14
+        if box_y < 8:
+            box_y = y + 14
+        if box_y + box_height > canvas_height - 8:
+            box_y = canvas_height - box_height - 8
+
+        self.canvas.create_rectangle(
+            box_x,
+            box_y,
+            box_x + box_width,
+            box_y + box_height,
+            fill="#101828",
+            outline="#344054",
+            width=1,
+            tags="tooltip",
+        )
+        for idx, line in enumerate(lines):
+            self.canvas.create_text(
+                box_x + 10,
+                box_y + 12 + idx * 17,
+                text=line,
+                anchor="w",
+                fill="#f8fafc" if idx == 0 else "#d0d5dd",
+                font=("Microsoft YaHei UI", 9, "bold" if idx == 0 else "normal"),
+                tags="tooltip",
+            )
+
+    def _build_tooltip_lines(self, bar) -> list[str]:
+        amount, pct_chg = self._resolve_display_metrics(bar)
+        return [
+            bar.ts[:10],
+            f"开 {bar.open:.2f}  高 {bar.high:.2f}",
+            f"低 {bar.low:.2f}  收 {bar.close:.2f}",
+            f"量 {bar.volume:.0f}",
+            f"额 {amount / 10000:.2f} 万",
+            f"涨跌 {pct_chg:+.2f}%",
+        ]
+
+    def _resolve_display_metrics(self, bar) -> tuple[float, float]:
+        amount = bar.amount
+        if amount <= 0 and bar.volume > 0 and bar.close > 0:
+            amount = bar.volume * bar.close
+
+        pct_chg = bar.pct_chg
+        if abs(pct_chg) < 1e-9:
+            bar_index = next((idx for idx, current in enumerate(self._bars) if current.ts == bar.ts), -1)
+            if bar_index > 0:
+                prev_close = self._bars[bar_index - 1].close
+                if prev_close:
+                    pct_chg = (bar.close - prev_close) / prev_close * 100
+        return amount, pct_chg
 
     def _on_press(self, event) -> None:
         self._dragging = True
@@ -635,6 +1025,10 @@ class SimpleLineChart:
             self._view_start = max(0, min(max_start, self._view_start + int(args[1]) * 3))
         self.render(self._bars, self._selected_date)
 
+    def _on_canvas_configure(self, _event) -> None:
+        if self._bars:
+            self.render(self._bars, self._selected_date)
+
     def _update_scroll(self) -> None:
         total = max(len(self._bars), 1)
         first = self._view_start / total
@@ -655,6 +1049,8 @@ class SimpleMinuteChart:
         self.frame = tk.Frame(parent, bg="#ffffff", bd=1, relief="solid")
         self._bars = []
         self._points = []
+        self._render_signature = None
+        self._selected_date = ""  # 添加缺失的属性
 
         tk.Label(self.frame, text=title, anchor="w", bg="#ffffff", font=("Microsoft YaHei UI", 10, "bold")).pack(fill="x", padx=8, pady=(8, 0))
         self.canvas = tk.Canvas(self.frame, bg="#ffffff", height=220, highlightthickness=0)
@@ -671,11 +1067,22 @@ class SimpleMinuteChart:
         self.legend.pack(fill="x", padx=8, pady=(0, 8))
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.last_selected_bar = None
 
     def render(self, bars: list, selected_date: str = "") -> None:
+        bars_list = list(bars)
+        render_signature = (
+            selected_date,
+            max(self.canvas.winfo_width(), 340),
+            max(self.canvas.winfo_height(), 240),
+            tuple((bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.amount) for bar in bars_list),
+        )
+        if render_signature == self._render_signature:
+            return
+        self._render_signature = render_signature
         self.canvas.delete("all")
-        self._bars = list(bars)
+        self._bars = bars_list
         self._points = []
         self.last_selected_bar = None
 
@@ -804,6 +1211,10 @@ class SimpleMinuteChart:
                 font=("Microsoft YaHei UI", 9, "bold" if idx == 0 else "normal"),
                 tags="tooltip",
             )
+
+    def _on_canvas_configure(self, _event) -> None:
+        if self._bars:
+            self.render(self._bars, self._selected_date)
 
 
 class PopupNotifier:
