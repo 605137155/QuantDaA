@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import csv
 import random
 import time
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from src.models.candle import Candle
 from src.models.stock_snapshot import StockSnapshot
-from src.utils.trading_day_utils import is_trading_session
+from src.utils.trading_day_utils import is_trading_day, is_trading_session
 
 
 @dataclass
@@ -44,6 +47,8 @@ class AppRunner:
         self._warmed_up = False
         self._last_snapshot_save_date = ""
         self._last_intraday_candidate_snapshot_key = ""
+        self._latest_market_snapshot_trade_date = ""
+        self._latest_market_snapshot_map: dict[str, StockSnapshot] = {}
         scan_settings = settings.get("scan", {})
         self._pool_refresh_base_seconds = int(scan_settings.get("pool_refresh_seconds", 60))
         self._pool_refresh_jitter_seconds = int(scan_settings.get("pool_refresh_jitter_seconds", 5))
@@ -51,6 +56,21 @@ class AppRunner:
         self._pool_refresh_max_seconds = int(scan_settings.get("pool_refresh_max_seconds", 300))
         self._pool_refresh_failures = 0
         self._pool_refresh_rng = random.Random()
+
+    def get_candidate_profiles(self) -> list[str]:
+        if self.candidate_scoring_service is None:
+            return []
+        return self.candidate_scoring_service.get_available_profiles()
+
+    def get_active_candidate_profile(self) -> str:
+        if self.candidate_scoring_service is None:
+            return ""
+        return self.candidate_scoring_service.active_profile
+
+    def set_candidate_profile(self, profile_name: str) -> bool:
+        if self.candidate_scoring_service is None:
+            return False
+        return self.candidate_scoring_service.set_active_profile(profile_name)
 
     @property
     def provider_name(self) -> str:
@@ -122,6 +142,23 @@ class AppRunner:
             )
         return snapshot
 
+    def _get_market_snapshot_by_code(self, stock_code: str, trade_date: str) -> StockSnapshot | None:
+        snapshot = self.state.snapshot_map.get(stock_code)
+        if snapshot is not None:
+            snapshot_trade_date = snapshot.updated_at[:10] if snapshot.updated_at else ""
+            if not trade_date or snapshot_trade_date >= trade_date:
+                return snapshot
+
+        if self._latest_market_snapshot_trade_date != trade_date:
+            try:
+                market_rows = self.provider.get_market_snapshot()
+            except Exception:
+                return None
+            self._latest_market_snapshot_map = {row.code: row for row in market_rows}
+            self._latest_market_snapshot_trade_date = trade_date
+
+        return self._latest_market_snapshot_map.get(stock_code)
+
     @staticmethod
     def _group_minute_bars(minute_bars: list) -> dict[str, list]:
         grouped: dict[str, list] = {}
@@ -129,8 +166,55 @@ class AppRunner:
             grouped.setdefault(bar.ts[:10], []).append(bar)
         return grouped
 
+    @staticmethod
+    def _merge_live_daily_bar(stock_code: str, daily_bars: list, minute_bars: list, snapshot: StockSnapshot) -> list:
+        bars = list(daily_bars)
+        live_date = snapshot.updated_at[:10] if snapshot.updated_at else ""
+        if not live_date and minute_bars:
+            live_date = max(bar.ts[:10] for bar in minute_bars)
+        if not live_date:
+            return bars
+
+        last_daily_date = bars[-1].ts[:10] if bars else ""
+        if last_daily_date and live_date < last_daily_date:
+            return bars
+
+        live_minute_bars = [bar for bar in minute_bars if bar.ts[:10] == live_date]
+        first_minute = live_minute_bars[0] if live_minute_bars else None
+        last_minute = live_minute_bars[-1] if live_minute_bars else None
+        open_price = snapshot.open or (first_minute.open if first_minute else 0.0)
+        close_price = snapshot.last_price or (last_minute.close if last_minute else 0.0)
+        high_price = snapshot.high or max((bar.high for bar in live_minute_bars), default=0.0)
+        low_candidates = [value for value in (snapshot.low,) if value > 0]
+        if live_minute_bars:
+            low_candidates.append(min(bar.low for bar in live_minute_bars))
+        low_price = min(low_candidates) if low_candidates else 0.0
+        volume = snapshot.volume or sum(bar.volume for bar in live_minute_bars)
+        amount = snapshot.amount or sum(bar.amount for bar in live_minute_bars)
+
+        if not any(value > 0 for value in (open_price, close_price, high_price, low_price)):
+            return bars
+
+        live_bar = Candle(
+            stock_code=stock_code,
+            ts=live_date,
+            open=open_price,
+            high=max(high_price, open_price, close_price),
+            low=min(value for value in (low_price, open_price, close_price) if value > 0),
+            close=close_price,
+            volume=volume,
+            amount=amount,
+            pct_chg=snapshot.pct_chg,
+        )
+        if last_daily_date == live_date:
+            bars[-1] = live_bar
+        else:
+            bars.append(live_bar)
+        return bars
+
     def _build_stock_detail(self, stock_code: str, daily_bars: list, minute_bars: list, selected_date: str = "") -> dict:
         snapshot = self._get_snapshot(stock_code)
+        daily_bars = self._merge_live_daily_bar(stock_code, daily_bars, minute_bars, snapshot)
         minute_bars_by_date = self._group_minute_bars(minute_bars)
         available_minute_dates = sorted(minute_bars_by_date)
         target_date = selected_date or (available_minute_dates[-1] if available_minute_dates else "")
@@ -146,12 +230,80 @@ class AppRunner:
         }
 
     def _get_scoring_daily_bars(self, stock_code: str, limit: int = 60) -> list:
+        # 先尝试从数据库获取
         daily_bars = self.daily_repo.get_recent(stock_code, limit=limit)
-        if len(daily_bars) < min(limit, 20):
+        if len(daily_bars) >= min(limit, 20):
+            return daily_bars
+
+        # 检查缓存时间，避免重复请求
+        now = time.time()
+        last_fetch = getattr(self, '_daily_fetch_timestamps', {}).get(stock_code, 0)
+        if not hasattr(self, '_daily_fetch_timestamps'):
+            self._daily_fetch_timestamps = {}
+        if now - last_fetch < 60:  # 60秒内不重复请求
+            return daily_bars
+
+        # 缓存过期，发起网络请求
+        self._daily_fetch_timestamps[stock_code] = now
+        fetched = self.provider.get_daily_bars(stock_code, limit=limit)
+        if fetched:
+            self.daily_repo.replace_for_stock(stock_code, fetched)
+            daily_bars = fetched
+        return daily_bars
+
+    def _get_scoring_daily_bars_until(self, stock_code: str, trade_date: str, limit: int = 60) -> list:
+        fetch_limit = max(limit, 240)
+        if hasattr(self.daily_repo, "get_recent_until"):
+            daily_bars = self.daily_repo.get_recent_until(stock_code, trade_date, limit=fetch_limit)
+        else:
+            daily_bars = [bar for bar in self.daily_repo.get_recent(stock_code, limit=fetch_limit) if bar.ts[:10] <= trade_date]
+
+        if len(daily_bars) >= min(limit, 20):
+            return daily_bars[-limit:]
+
+        # 检查缓存时间，避免重复请求
+        now = time.time()
+        last_fetch = getattr(self, '_daily_fetch_timestamps', {}).get(stock_code, 0)
+        if not hasattr(self, '_daily_fetch_timestamps'):
+            self._daily_fetch_timestamps = {}
+        if now - last_fetch < 60:  # 60秒内不重复请求
+            return daily_bars[-limit:]
+
+        # 缓存过期，发起网络请求
+        self._daily_fetch_timestamps[stock_code] = now
+        fetched = self.provider.get_daily_bars(stock_code, limit=fetch_limit)
+        if fetched:
+            self.daily_repo.replace_for_stock(stock_code, fetched)
+            if hasattr(self.daily_repo, "get_recent_until"):
+                daily_bars = self.daily_repo.get_recent_until(stock_code, trade_date, limit=fetch_limit)
+            else:
+                daily_bars = [bar for bar in fetched if bar.ts[:10] <= trade_date]
+        return daily_bars[-limit:]
+
+    def _get_recent_daily_bars_with_forward_window(self, stock_code: str, trade_date: str, limit: int = 240) -> list:
+        daily_bars = self.daily_repo.get_recent(stock_code, limit=limit)
+
+        # 检查是否需要获取新数据
+        need_fetch = not any(bar.ts[:10] >= trade_date for bar in daily_bars)
+
+        # 如果需要获取，检查缓存时间
+        if need_fetch:
+            now = time.time()
+            if not hasattr(self, '_forward_fetch_timestamps'):
+                self._forward_fetch_timestamps = {}
+            last_fetch = self._forward_fetch_timestamps.get(stock_code, 0)
+
+            # 60秒内不重复请求
+            if now - last_fetch < 60:
+                return daily_bars
+
+            # 缓存过期，发起网络请求
+            self._forward_fetch_timestamps[stock_code] = now
             fetched = self.provider.get_daily_bars(stock_code, limit=limit)
             if fetched:
                 self.daily_repo.replace_for_stock(stock_code, fetched)
                 daily_bars = fetched
+
         return daily_bars
 
     @staticmethod
@@ -203,6 +355,17 @@ class AppRunner:
             )
         return normalized
 
+    def should_save_daily_snapshots(self, now: datetime | None = None) -> bool:
+        if self.rank_snapshot_repo is None:
+            return False
+        current = now or datetime.now()
+        if not is_trading_day(current):
+            return False
+        if current.hour < 15:
+            return False
+        trade_date = current.strftime("%Y-%m-%d")
+        return self._last_snapshot_save_date != trade_date
+
     def save_daily_snapshots_if_needed(
         self,
         ths_hourly_rows: list | None = None,
@@ -210,15 +373,10 @@ class AppRunner:
         kpl_rows: list | None = None,
         now: datetime | None = None,
     ) -> None:
-        if self.rank_snapshot_repo is None:
-            return
         current = now or datetime.now()
-        if current.hour < 15:
+        if not self.should_save_daily_snapshots(current):
             return
-
         trade_date = current.strftime("%Y-%m-%d")
-        if self._last_snapshot_save_date == trade_date:
-            return
 
         self.rank_snapshot_repo.replace_snapshot(
             trade_date,
@@ -279,10 +437,6 @@ class AppRunner:
     def build_replay_candidate_ranking(self, trade_date: str | None = None) -> list[dict]:
         if self.rank_snapshot_repo is None or self.candidate_scoring_service is None:
             return []
-        if trade_date and self.candidate_score_repo is not None:
-            saved = self.candidate_score_repo.get_scores(trade_date, "replay")
-            if saved:
-                return saved
 
         monitor_rows = (
             self.rank_snapshot_repo.get_snapshot(trade_date, "monitor_close")
@@ -299,6 +453,11 @@ class AppRunner:
             if trade_date
             else self.rank_snapshot_repo.get_latest_snapshot("ths_hourly_close")
         )
+        ths_value_rows = (
+            self.rank_snapshot_repo.get_snapshot(trade_date, "ths_value_close")
+            if trade_date
+            else self.rank_snapshot_repo.get_latest_snapshot("ths_value_close")
+        )
         kpl_rows = (
             self.rank_snapshot_repo.get_snapshot(trade_date, "kpl_close")
             if trade_date
@@ -309,6 +468,7 @@ class AppRunner:
         for rows, key in (
             (monitor_rows, "monitor_rank_yesterday"),
             (ths_rows, "ths_rank_yesterday"),
+            (ths_value_rows, "ths_value_rank_yesterday"),
             (kpl_rows, "kpl_rank_yesterday"),
         ):
             for row in rows:
@@ -322,7 +482,8 @@ class AppRunner:
 
         results = []
         for stock_code, rank_context in rank_context_map.items():
-            daily_bars = self._get_scoring_daily_bars(stock_code)
+            scoring_trade_date = trade_date or datetime.now().strftime("%Y-%m-%d")
+            daily_bars = self._get_scoring_daily_bars_until(stock_code, scoring_trade_date)
             score = self.candidate_scoring_service.score_replay_candidate(
                 stock_code,
                 rank_context["stock_name"],
@@ -330,7 +491,14 @@ class AppRunner:
                 rank_context,
             )
             if score is not None:
+                snapshot = self.state.snapshot_map.get(stock_code)
+                if snapshot is not None:
+                    score["metrics"] = {
+                        **score.get("metrics", {}),
+                        "live_pct_chg": float(snapshot.pct_chg or 0.0),
+                    }
                 results.append(score)
+        results = self.candidate_scoring_service.rerank_replay_rows(results)
         results.sort(key=lambda item: (-item["total_score"], item["stock_code"]))
         return results
 
@@ -386,6 +554,12 @@ class AppRunner:
 
         if session_type == "replay":
             rows = self.candidate_score_repo.get_scores(trade_date, "replay")
+            if rows and self.candidate_scoring_service is not None:
+                rows = self.candidate_scoring_service.rerank_replay_rows(rows)
+            if not rows:
+                rows = self.build_replay_candidate_ranking(trade_date)
+            if not rows:
+                rows = self.candidate_score_repo.get_scores(trade_date, "replay")
         else:
             rows = self.candidate_score_repo.get_latest_history_snapshot(trade_date, "intraday")
         if not rows:
@@ -398,29 +572,246 @@ class AppRunner:
             return []
         return self.candidate_score_repo.get_available_trade_dates(session_type)
 
+    def export_candidate_review_csv(self, session_type: str, trade_date: str, output_path: str | Path) -> Path:
+        rows = self.get_candidate_review_rows(session_type, trade_date)
+        if not rows:
+            raise ValueError(f"{trade_date} 没有可导出的 {session_type} 候选数据")
+
+        rows = self._attach_live_labels(rows, trade_date)
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        metric_keys = sorted({key for row in rows for key in row.get("metrics", {}).keys()})
+        fieldnames = [
+            "trade_date",
+            "session_type",
+            "rank_no",
+            "stock_code",
+            "stock_name",
+            "total_score",
+            "grade",
+            "heat_score",
+            "market_cap_score",
+            "volume_price_score",
+            "position_score",
+            "risk_penalty",
+            "next_day_pct",
+            "next_day_mode",
+            "next_trade_date",
+            "label_live_pct",
+            "label_live_up",
+            "label_live_strong",
+            "label_live_rank_pct",
+            "flags",
+            "risks",
+        ] + [f"metric_{key}" for key in metric_keys]
+
+        with output.open("w", newline="", encoding="utf-8-sig") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+            for index, row in enumerate(rows, start=1):
+                exported_row = {
+                    "trade_date": trade_date,
+                    "session_type": session_type,
+                    "rank_no": index,
+                    "stock_code": row["stock_code"],
+                    "stock_name": row["stock_name"],
+                    "total_score": row["total_score"],
+                    "grade": row["grade"],
+                    "heat_score": row.get("heat_score", 0),
+                    "market_cap_score": row.get("market_cap_score", 0),
+                    "volume_price_score": row.get("volume_price_score", 0),
+                    "position_score": row.get("position_score", 0),
+                    "risk_penalty": row.get("risk_penalty", 0),
+                    "next_day_pct": row.get("next_day_pct"),
+                    "next_day_mode": row.get("next_day_mode", ""),
+                    "next_trade_date": row.get("next_trade_date", ""),
+                    "label_live_pct": row.get("label_live_pct"),
+                    "label_live_up": row.get("label_live_up"),
+                    "label_live_strong": row.get("label_live_strong"),
+                    "label_live_rank_pct": row.get("label_live_rank_pct"),
+                    "flags": "|".join(row.get("flags", [])),
+                    "risks": "|".join(row.get("risks", [])),
+                }
+                for key in metric_keys:
+                    exported_row[f"metric_{key}"] = row.get("metrics", {}).get(key)
+                writer.writerow(exported_row)
+
+        return output
+
+    def _attach_live_labels(self, rows: list[dict], trade_date: str) -> list[dict]:
+        labeled_rows = [dict(row) for row in rows]
+        live_pct_rows: list[tuple[int, float]] = []
+        current_trade_date = datetime.now().strftime("%Y-%m-%d")
+
+        for index, row in enumerate(labeled_rows):
+            live_pct = self._resolve_live_label_pct(row, trade_date, current_trade_date)
+            row["label_live_pct"] = live_pct
+            row["label_live_up"] = 1 if live_pct is not None and live_pct > 0 else (0 if live_pct is not None else None)
+            row["label_live_strong"] = 1 if live_pct is not None and live_pct >= 2.0 else (0 if live_pct is not None else None)
+            row["label_live_rank_pct"] = None
+            if live_pct is not None:
+                live_pct_rows.append((index, live_pct))
+
+        if live_pct_rows:
+            sorted_rows = sorted(live_pct_rows, key=lambda item: item[1])
+            denominator = max(len(sorted_rows) - 1, 1)
+            for rank_index, (row_index, _live_pct) in enumerate(sorted_rows):
+                labeled_rows[row_index]["label_live_rank_pct"] = round(rank_index / denominator, 4) if len(sorted_rows) > 1 else 1.0
+
+        return labeled_rows
+
+    def _resolve_live_label_pct(self, row: dict, trade_date: str, current_trade_date: str) -> float | None:
+        # 优先从日线库取trade_date当天的实际收盘价作为基准
+        reference_price = 0.0
+        try:
+            daily_bars = self._get_recent_daily_bars_with_forward_window(row["stock_code"], trade_date, limit=240)
+            trade_bar = next((bar for bar in daily_bars if bar.ts[:10] == trade_date[:10]), None)
+            if trade_bar is not None and trade_bar.close > 0:
+                reference_price = trade_bar.close
+        except Exception:
+            pass
+
+        # fallback: 用评分时存的reference_price
+        if reference_price <= 0:
+            reference_price = float(row.get("metrics", {}).get("reference_price", 0.0) or 0.0)
+        if reference_price <= 0:
+            return None
+
+        snapshot = self.state.snapshot_map.get(row["stock_code"])
+        if snapshot is None or snapshot.last_price <= 0:
+            return None
+
+        snapshot_trade_date = snapshot.updated_at[:10] if snapshot.updated_at else current_trade_date
+        if snapshot_trade_date < trade_date:
+            return None
+
+        return round((snapshot.last_price - reference_price) / reference_price * 100, 2)
+
     def _enrich_forward_performance(self, row: dict, trade_date: str) -> dict:
-        reference_price = float(row.get("metrics", {}).get("reference_price", 0.0) or 0.0)
         row["next_day_pct"] = None
         row["next_day_mode"] = ""
         row["next_trade_date"] = ""
-        if reference_price <= 0:
-            return row
+        row["today_pct"] = None
 
-        daily_bars = self._get_scoring_daily_bars(row["stock_code"], limit=120)
-        next_bar = next((bar for bar in daily_bars if bar.ts > trade_date), None)
+        daily_bars = self._get_recent_daily_bars_with_forward_window(row["stock_code"], trade_date, limit=240)
+
+        # 从日线库取当天的实际收盘价作为基准
+        trade_bar = next((bar for bar in daily_bars if bar.ts[:10] == trade_date[:10]), None)
+        if trade_bar is None or trade_bar.close <= 0:
+            return row
+        reference_price = trade_bar.close
+
+        # 计算当日涨幅
+        today_pct = None
+        try:
+            idx = daily_bars.index(trade_bar)
+            if idx > 0:
+                prev_bar = daily_bars[idx - 1]
+                if prev_bar.close > 0:
+                    today_pct = round((trade_bar.close - prev_bar.close) / prev_bar.close * 100, 2)
+        except Exception:
+            pass
+        if today_pct is None:
+            today_pct = getattr(trade_bar, "pct_chg", None)
+        row["today_pct"] = today_pct
+
+        next_bar = next((bar for bar in daily_bars if bar.ts[:10] > trade_date[:10]), None)
+        current_trade_date = datetime.now().strftime("%Y-%m-%d")
+        use_current_snapshot = current_trade_date > trade_date and self._is_yesterday_trade_date(trade_date, current_trade_date)
+
+        # 库里没有次日数据，判断是否需要获取
+        if next_bar is None:
+            # 检查次日是否是工作日且已经开盘
+            should_fetch = self._should_fetch_next_day_data(trade_date)
+            if should_fetch:
+                try:
+                    fetched = self.provider.get_daily_bars(row["stock_code"], limit=10)
+                    if fetched:
+                        self.daily_repo.replace_for_stock(row["stock_code"], fetched)
+                        daily_bars = fetched
+                        next_bar = next((bar for bar in daily_bars if bar.ts[:10] > trade_date[:10]), None)
+                except Exception:
+                    pass
+
+        if (
+            use_current_snapshot
+            and is_trading_session()
+            and next_bar is not None
+            and next_bar.ts[:10] == current_trade_date
+        ):
+            snapshot = self._get_market_snapshot_by_code(row["stock_code"], current_trade_date)
+            if snapshot is not None and snapshot.last_price > 0:
+                row["next_trade_date"] = current_trade_date
+                row["next_day_pct"] = round((snapshot.last_price - reference_price) / reference_price * 100, 2)
+                row["next_day_mode"] = "current"
+                return row
+
         if next_bar is not None and next_bar.close:
+            # 日线库里有次日收盘价
             row["next_trade_date"] = next_bar.ts
             row["next_day_pct"] = round((next_bar.close - reference_price) / reference_price * 100, 2)
             row["next_day_mode"] = "close"
             return row
 
-        current_trade_date = datetime.now().strftime("%Y-%m-%d")
-        snapshot = self.state.snapshot_map.get(row["stock_code"])
-        if snapshot is not None and current_trade_date > trade_date and snapshot.last_price > 0:
-            row["next_trade_date"] = current_trade_date
-            row["next_day_pct"] = round((snapshot.last_price - reference_price) / reference_price * 100, 2)
-            row["next_day_mode"] = "current"
+        # 次日就是今天 → 用实时快照价（盘中=实时价，收盘后=收盘价）
+        if use_current_snapshot and is_trading_session():
+            snapshot = self._get_market_snapshot_by_code(row["stock_code"], current_trade_date)
+            if snapshot is not None and snapshot.last_price > 0:
+                row["next_trade_date"] = current_trade_date
+                row["next_day_pct"] = round((snapshot.last_price - reference_price) / reference_price * 100, 2)
+                row["next_day_mode"] = "current"
         return row
+
+    def _should_fetch_next_day_data(self, trade_date: str) -> bool:
+        """判断是否应该获取次日数据
+        条件：
+        1. 次日是工作日（周一到周五）
+        2. 当前时间已经过了次日9:15（集合竞价开始时间）
+        3. 或者次日已经收盘（15:00之后）
+        """
+        try:
+            from datetime import datetime, timedelta
+
+            # 解析交易日期
+            trade_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+            current_dt = datetime.now()
+
+            # 计算次日日期
+            next_dt = trade_dt + timedelta(days=1)
+
+            # 检查次日是否是工作日（周一到周五）
+            if next_dt.weekday() >= 5:  # 5=周六, 6=周日
+                return False
+
+            # 如果次日是今天
+            if next_dt.date() == current_dt.date():
+                # 检查当前时间是否已经过了9:15
+                current_time = current_dt.hour * 60 + current_dt.minute
+                if current_time < 555:  # 9:15 = 555分钟
+                    return False
+                return True
+
+            # 如果次日已经过去（昨天或更早），应该获取
+            if next_dt.date() < current_dt.date():
+                return True
+
+            # 如果次日是未来日期，不获取
+            return False
+
+        except Exception:
+            # 如果解析失败，默认获取（保持原有行为）
+            return True
+
+    @staticmethod
+    def _is_yesterday_trade_date(trade_date: str, current_trade_date: str) -> bool:
+        try:
+            trade_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+            current_dt = datetime.strptime(current_trade_date, "%Y-%m-%d")
+        except ValueError:
+            return False
+        return (current_dt - trade_dt).days == 1
 
     @staticmethod
     def _select_last_trade_dates(minute_bars_by_date: dict[str, list], max_dates: int) -> list[str]:

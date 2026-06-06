@@ -58,3 +58,30 @@ class DailyBarRepository:
             )
             for row in reversed(rows)
         ]
+
+    def get_recent_until(self, stock_code: str, trade_date: str, limit: int) -> list[Candle]:
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT stock_code, trade_date, open, high, low, close, volume, amount, pct_chg
+                FROM daily_bars
+                WHERE stock_code = ? AND trade_date <= ?
+                ORDER BY trade_date DESC
+                LIMIT ?
+                """,
+                (stock_code, trade_date, limit),
+            ).fetchall()
+        return [
+            Candle(
+                stock_code=row[0],
+                ts=row[1],
+                open=row[2],
+                high=row[3],
+                low=row[4],
+                close=row[5],
+                volume=row[6],
+                amount=row[7],
+                pct_chg=row[8],
+            )
+            for row in reversed(rows)
+        ]

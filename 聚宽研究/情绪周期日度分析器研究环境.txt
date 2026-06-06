@@ -1,0 +1,1524 @@
+#!/usr/bin/env python
+# coding: utf-8
+"""
+情绪周期日度分析器 —— 聚宽研究环境专用
+========================================
+功能摘要
+--------
+  · L1  全局市场情绪  (0~10 分)
+  · L2  主线情绪      (0~20 分，研究环境无竞价数据，上限 13 分，附注说明)
+  · L3  龙头情绪信号  (none / warning / confirm)
+  · 动态阈值          (panic / neutral / euphoria 三档)
+  · 主线板块自动识别  (5日动量Top10→3日涨停率Top3，排除>500/＜20成员概念，日涨停≥1)
+  · 双日确认退潮检测
+  · 五档仓位建议
+
+用法（研究环境 Notebook / .py 脚本）
+--------------------------------------
+  ana = EmotionCycleDailyAnalyzer(env='research')  # env='live' 用于实盘
+
+  # 单日分析（打印详细报告）
+  result = ana.analyze('2025-04-24')
+
+  # 日期区间批量分析（返回 DataFrame）
+  df = ana.run_range('2025-03-01', '2025-04-30')
+  display(df)
+
+注意事项
+--------
+  · 研究环境中 get_call_auction / get_current_data 无法获取历史竞价数据，
+    故 L2 竞价相关 7 分（核心溢价 3 分 + 竞价因子 4 分）在此脚本中不计算；
+    报告中会标注"研究环境，竞价7分不计"。
+  · 每次 analyze() 之后，内部状态（断板天数、历史分数等）会被保留，
+    适合按日期顺序连续调用以实现「双日确认」逻辑。
+    若需重置状态请调用 reset()。
+  · 批量 run_range() 会自动按交易日顺序重置并顺序推进状态。
+"""
+
+from jqdata import *
+import pandas as pd
+import numpy as np
+import datetime as dt
+from datetime import timedelta
+
+# ─────────────────────────────────────────────
+# 工具函数（独立于类，方便复用）
+# ─────────────────────────────────────────────
+
+def _to_str(date):
+    """统一转为 'YYYY-MM-DD' 字符串"""
+    if isinstance(date, str):
+        return date
+    if isinstance(date, (dt.datetime, dt.date)):
+        return date.strftime('%Y-%m-%d')
+    return str(date)
+
+
+def _prepare_stock_list(date_str):
+    """过滤科创/北交/ST/新股/停牌，返回可用股票列表"""
+    lst = get_all_securities('stock', date_str).index.tolist()
+    # 过滤科创板(68)、北交所(4/8)、创业板新股(30)中的转板
+    lst = [s for s in lst if s[:2] not in ('68',) and s[0] not in ('4', '8')]
+    # 过滤新股(<50交易日)
+    d_date = dt.datetime.strptime(date_str, '%Y-%m-%d').date()
+    lst = [s for s in lst
+           if d_date - get_security_info(s).start_date > timedelta(days=50)]
+    # 过滤ST
+    try:
+        st_df = get_extras('is_st', lst, start_date=date_str, end_date=date_str, df=True).T
+        st_df.columns = ['is_st']
+        lst = list(st_df[st_df['is_st'] == False].index)
+    except Exception:
+        pass
+    # 过滤停牌
+    try:
+        pause_df = get_price(lst, end_date=date_str, frequency='daily',
+                             fields=['paused'], count=1, panel=False, fill_paused=True)
+        lst = list(pause_df[pause_df['paused'] == 0]['code'])
+    except Exception:
+        pass
+    return lst
+
+
+def _get_hl_stocks(stock_list, date_str):
+    """返回当日涨停股列表（close == high_limit）"""
+    try:
+        df = get_price(stock_list, end_date=date_str, frequency='daily',
+                       fields=['close', 'high_limit'], count=1,
+                       panel=False, fill_paused=False, skip_paused=False).dropna()
+        df = df[df['close'] == df['high_limit']]
+        return list(df['code']) if 'code' in df.columns else list(df.index)
+    except Exception:
+        return []
+
+
+def _get_limit_down_count(stock_list, date_str):
+    """统计当日跌停家数"""
+    try:
+        df = get_price(stock_list, end_date=date_str, frequency='daily',
+                       fields=['close', 'low_limit'], count=1,
+                       panel=False, fill_paused=False, skip_paused=False).dropna()
+        return int((df['close'] == df['low_limit']).sum())
+    except Exception:
+        return 0
+
+
+def _get_hl_count_df(stock_list, date_str, watch_days):
+    """返回 DataFrame(index=code, columns=['count','extreme_count'])，统计近 watch_days 日涨停次数"""
+    if not stock_list:
+        return pd.DataFrame(columns=['count', 'extreme_count'])
+    df = get_price(stock_list, end_date=date_str, frequency='daily',
+                   fields=['close', 'high_limit', 'low', 'open'],
+                   count=watch_days, panel=False,
+                   fill_paused=False, skip_paused=False)
+    if df.empty:
+        return pd.DataFrame(index=stock_list, data={'count': 0, 'extreme_count': 0})
+    df['is_limit']   = df['close'] == df['high_limit']
+    df['is_yizi']    = (df['low'] == df['high_limit']) & df['is_limit']
+    df['is_tzi']     = (df['open'] == df['high_limit']) & df['is_limit'] & (df['low'] < df['high_limit'])
+    df['is_extreme'] = df['is_yizi'] | df['is_tzi']
+    counts = df.groupby('code')[['is_limit', 'is_extreme']].sum().astype(int)
+    counts.columns = ['count', 'extreme_count']
+    missing = [s for s in stock_list if s not in counts.index]
+    if missing:
+        counts = pd.concat([counts,
+                            pd.DataFrame({'count': 0, 'extreme_count': 0}, index=missing)])
+    return counts
+
+
+def _get_continue_count_df(hl_list, date_str, watch_days=10):
+    """返回每只股票的最大连续涨停天数 DataFrame"""
+    if not hl_list:
+        return pd.DataFrame()
+    result = pd.DataFrame()
+    for d in range(2, watch_days + 1):
+        hlc  = _get_hl_count_df(hl_list, date_str, d)
+        chlc = hlc[hlc['count'] == d]
+        result = pd.concat([result, chlc])
+    if result.empty:
+        return result
+    ccd = pd.DataFrame()
+    for s in list(set(result.index)):
+        tmp = result.loc[[s]]
+        if len(tmp) > 1:
+            m   = tmp['count'].max()
+            tmp = tmp[tmp['count'] == m]
+        ccd = pd.concat([ccd, tmp])
+    if not ccd.empty:
+        ccd = ccd.sort_values('count', ascending=False)
+    return ccd
+
+
+def _get_up_ratio(stock_list, date_str):
+    """全市场今日上涨股票占比"""
+    try:
+        df = get_price(stock_list, end_date=date_str, frequency='daily',
+                       fields=['close'], count=2, panel=False,
+                       fill_paused=False, skip_paused=True).dropna()
+        results = []
+        for _, grp in df.groupby('code'):
+            grp = grp.sort_values('time')
+            if len(grp) >= 2:
+                results.append(grp['close'].iloc[-1] > grp['close'].iloc[-2])
+        return sum(results) / len(results) if results else 0.5
+    except Exception:
+        return 0.5
+
+
+def _get_high_face_count(stock_list, date_str):
+    """高位股（近20日≥5次涨停）中当日日内最大回撤≥8%的家数"""
+    try:
+        hlc_df = _get_hl_count_df(stock_list, date_str, 20)
+        high_pos = hlc_df[hlc_df['count'] >= 5].index.tolist()
+        if not high_pos:
+            return 0
+        price_df = get_price(high_pos, end_date=date_str, frequency='daily',
+                             fields=['open', 'close', 'high'], count=1,
+                             panel=False, fill_paused=False, skip_paused=True).dropna()
+        price_df['intraday_drop'] = (price_df['high'] - price_df['close']) / price_df['high']
+        return int((price_df['intraday_drop'] >= 0.08).sum())
+    except Exception:
+        return 0
+
+
+def _get_sky_earth_count(stock_list, date_str):
+    """天地板家数：开盘涨停，收盘跌停"""
+    try:
+        df = get_price(stock_list, end_date=date_str, frequency='daily',
+                       fields=['open', 'close', 'high_limit', 'low_limit'],
+                       count=1, panel=False, fill_paused=False, skip_paused=False).dropna()
+        return int(((df['open'] == df['high_limit']) & (df['close'] == df['low_limit'])).sum())
+    except Exception:
+        return 0
+
+
+# ─────────────────────────────────────────────
+# 主类
+# ─────────────────────────────────────────────
+
+class EmotionCycleDailyAnalyzer:
+    """
+    情绪周期日度分析器（支持研究/实盘环境）
+    ========================================
+    状态变量说明
+    ------------
+    self.env                : str        'research' | 'live'  运行环境
+    self.emotion_history    : list[int]  最近2日 L2 分，用于双日确认
+    self.dragon_stock       : str|None   当前龙头股票代码
+    self.dragon_break_days  : int        龙头连续断板天数
+    self.sky_earth_count    : int        当日天地板家数（由 analyze() 更新）
+    self.systemic_risk_days : int        系统性风险连续天数
+    self.last_main_sector   : str|None   上一日#1主线板块代码，向后兼容
+    self.last_main_sectors  : list[str]  上一日所有主线板块代码列表，用于连续性偏好
+    self._blast_cache       : dict       当日缓存，analyze() 调用后自动清空
+    self._price_cache       : dict       跨概念共享5日价格数据缓存
+    self._concept_member_cache: dict     概念成分股缓存
+    """
+
+    def __init__(self, env='research'):
+        """
+        Parameters
+        ----------
+        env : str  'research' | 'live'
+            'research' — 研究环境，竞价7分不可用，L2上限13分，仓位阈值等比缩放
+            'live'     — 实盘/回测环境，竞价7分可用，L2上限20分，仓位用原始阈值
+        """
+        self.env = env
+        self.reset()
+
+    def reset(self):
+        """重置所有跨日状态（不重置 env）"""
+        self.emotion_history       = []   # 最近2日 L2 分
+        self.dragon_stock          = None
+        self.dragon_break_days     = 0
+        self.sky_earth_count       = 0
+        self.systemic_risk_days    = 0
+        self.last_main_sector      = None # 上一日#1主线板块代码，向后兼容
+        self.last_main_sectors     = []   # 上一日所有主线板块代码列表，用于连续性偏好
+        self._blast_cache          = {}   # 当日缓存，analyze() 调用后自动清空
+        self._price_cache          = {}   # 跨概念共享5日价格数据缓存
+        self._concept_member_cache = {}   # 概念成分股缓存
+
+    # ──────────────────────────────────────────
+    # 公开接口
+    # ──────────────────────────────────────────
+
+    def analyze(self, date, verbose=True):
+        """
+        分析指定交易日的情绪周期，更新内部状态，返回结果字典。
+
+        Parameters
+        ----------
+        date    : str   格式 'YYYY-MM-DD'（必须是交易日）
+        verbose : bool  是否打印详细报告，默认 True
+
+        Returns
+        -------
+        dict  包含所有分析结果
+        """
+        self._blast_cache = {}     # 每日清空缓存
+        date_str = _to_str(date)
+
+        # 基础股票池
+        initial_list = _prepare_stock_list(date_str)
+        initial_set  = set(initial_list)  # 快速查重，用于过滤 member_stocks
+
+        # ── Step 1  主线识别 ──────────────────────────────────────
+        main_info = self._detect_main_sector(date_str, initial_list, initial_set)
+
+        # ── Step 2  L1 全局情绪 ───────────────────────────────────
+        l1_result = self._calc_L1(date_str, initial_list)
+
+        # ── Step 3  L2 主线情绪（非竞价部分） ─────────────────────
+        l2_result = self._calc_L2(date_str, initial_list, main_info, l1_result)
+
+        # ── Step 4  L3 龙头情绪 ───────────────────────────────────
+        l3_result = self._calc_L3(date_str, main_info)
+
+        # ── Step 5  动态阈值 ──────────────────────────────────────
+        dyn_cfg = self._get_dynamic_config(l1_result['score'])
+
+        # ── Step 6  双日确认 ──────────────────────────────────────
+        two_day = self._check_two_day_confirm(l2_result['score'], l3_result['signal'])
+
+        # ── Step 7  五档仓位 ──────────────────────────────────────
+        position = self._get_position_level(l2_result['score'], l1_result)
+
+        # ── Step 8  天地板（更新跨日状态） ────────────────────────
+        self.sky_earth_count = _get_sky_earth_count(initial_list, date_str)
+
+        # ── Step 9  龙头断板状态持久化 ────────────────────────────
+        self._update_dragon_break(date_str, main_info, l3_result)
+
+        # ── 汇总 ──────────────────────────────────────────────────
+        result = {
+            'date'            : date_str,
+            'env'             : self.env,  # research / live
+            # L1
+            'L1_score'        : l1_result['score'],
+            'L1_layer'        : l1_result['layer'],           # panic/neutral/euphoria
+            'L1_systemic_risk': l1_result['systemic_risk'],
+            'L1_theme_retreat': l1_result['theme_retreat'],
+            'idx_pct'         : l1_result['idx_pct'],
+            'ld_hl_ratio'     : l1_result['ld_hl_ratio'],
+            'high_face'       : l1_result['high_face'],
+            # L2
+            'L2_score'        : l2_result['score'],           # 研究0~13，实盘0~20（含竞价）
+            'L2_has_main'     : main_info['has_main'],
+            'main_sector'     : main_info['sector_code'],
+            'main_sector_name': main_info['sector_name'],
+            'main_hl_count'   : main_info['hl_count'],
+            'main_sectors'    : main_info.get('sectors', []),  # 1~3个主线详情列表
+            'L2_tier_score'   : l2_result['tier_score'],
+            'L2_blast_score'  : l2_result['blast_score'],
+            'L2_grad_score'   : l2_result['grad_score'],
+            'L2_hface_score'  : l2_result['hface_score'],
+            # L3
+            'L3_signal'       : l3_result['signal'],          # none/warning/confirm
+            'dragon_stock'    : l3_result['dragon_stock'],
+            'dragon_boards'   : l3_result['boards'],
+            'dragon_break_days': self.dragon_break_days,
+            'sky_earth_count' : self.sky_earth_count,
+            # 动态阈值
+            'dyn_drop'        : dyn_cfg['drop'],
+            'dyn_premium'     : dyn_cfg['premium'],
+            'dyn_ld_limit'    : dyn_cfg['limit_down'],
+            'dyn_vol_ratio'   : dyn_cfg['volume_ratio'],
+            'dyn_score_thr'   : dyn_cfg['score'],
+            # 双日确认
+            'two_day_retreat' : two_day['retreat'],
+            'two_day_note'    : two_day['note'],
+            # 五档仓位
+            'pos_single_limit': position['single_limit'],
+            'pos_total_limit' : position['total_limit'],
+            'pos_level'       : position['level'],            # 0~5
+            'pos_note'        : position['note'],
+        }
+
+        if verbose:
+            self._print_report(result, l1_result, l2_result, l3_result,
+                               dyn_cfg, two_day, position, main_info)
+
+        return result
+
+    def run_range(self, start_date, end_date, verbose=False):
+        """
+        批量分析日期区间，按交易日顺序推进内部状态。
+
+        Parameters
+        ----------
+        start_date : str   'YYYY-MM-DD'
+        end_date   : str   'YYYY-MM-DD'
+        verbose    : bool  是否逐日打印，默认 False
+
+        Returns
+        -------
+        pd.DataFrame  每行为一个交易日的分析结果
+        """
+        self.reset()
+        trade_days = get_trade_days(start_date=start_date, end_date=end_date)
+        rows = []
+        total = len(trade_days)
+        for i, day in enumerate(trade_days, 1):
+            day_str = day.strftime('%Y-%m-%d')
+            print(f'[{i}/{total}] 分析 {day_str} ...', end='\r')
+            try:
+                row = self.analyze(day_str, verbose=verbose)
+                rows.append(row)
+            except Exception as e:
+                print(f'\n[警告] {day_str} 分析失败: {e}')
+        print('\n分析完毕！')
+        return pd.DataFrame(rows).set_index('date')
+
+    # ──────────────────────────────────────────
+    # 内部：Step 1 主线识别
+    # ──────────────────────────────────────────
+
+    def _detect_main_sector(self, date_str, initial_list, initial_set=None):
+        """
+        自动识别主线板块（双层动量筛选版）。
+        Step 1：近3日活跃概念中，取5日市值加权涨幅 Top 10
+        Step 2：Top10 中按3日涨停比例（含所有涨停类型）排序，取 Top 1~3
+        连续性偏好：前日主线若进入 Top10，排名 +1（软偏好）
+        返回字典包含 has_main / sectors(list) / 向后兼容字段
+        """
+        result = {
+            'has_main'     : False,
+            'sectors'      : [],
+            'sector_code'  : None,
+            'sector_name'  : '无',
+            'hl_count'     : 0,
+            'member_stocks': [],
+            'hl_stocks'    : [],
+        }
+        if initial_set is None:
+            initial_set = set(initial_list)
+
+        try:
+            # ── 当日有效涨停股（非一字板，用于 hl_count 和 hl_stocks 计算）──
+            hl_df = get_price(initial_list, end_date=date_str, frequency='daily',
+                              fields=['close', 'high_limit', 'low'], count=1,
+                              panel=False, fill_paused=False, skip_paused=False).dropna()
+            hl_df = hl_df[(hl_df['close'] == hl_df['high_limit']) &
+                          (hl_df['low'] != hl_df['high_limit'])]
+            today_hl_stocks = list(hl_df['code']) if 'code' in hl_df.columns else list(hl_df.index)
+
+            # ── Step 0：获取候选概念池（近3日活跃、≤500成分股）──
+            candidates = self._get_active_candidate_concepts(date_str, initial_list, initial_set)
+            # 兜底：3日候选池为空时，退回当日涨停概念构建候选池
+            if not candidates:
+                print(f'[主线识别] 3日候选池为空，启用当日涨停概念兜底 '
+                      f'(当日有效涨停 {len(today_hl_stocks)} 只)')
+                candidates = self._build_today_candidate_pool(
+                    date_str, today_hl_stocks, initial_set)
+                if not candidates:
+                    print(f'[主线识别] 当日兜底候选池也为空，无主线')
+                    self.last_main_sector = None
+                    self.last_main_sectors = []
+                    return result
+                print(f'[主线识别] 当日兜底候选池：{len(candidates)} 个概念')
+
+            # ── Step 1：5日市值加权涨幅排序 → Top 10 ──
+            print(f'[主线识别] Step1 动量计算: {len(candidates)} 个候选概念')
+            momentum_ranked = []
+            for conc_code, info in candidates.items():
+                ret, n = self._get_concept_weighted_return(
+                    conc_code, info['member_stocks'], date_str)
+                momentum_ranked.append((conc_code, info['concept_name'], ret, n,
+                                         info['member_stocks']))
+
+            momentum_ranked.sort(key=lambda x: x[2], reverse=True)
+            top10 = momentum_ranked[:10] if len(momentum_ranked) >= 10 else momentum_ranked
+            if not top10:
+                self.last_main_sector = None
+                self.last_main_sectors = []
+                return result
+
+            # ── 连续性偏好：前日主线若在 Top10 中，排名 +1 ──
+            if self.last_main_sectors:
+                boosted = []
+                for item in top10:
+                    conc_code = item[0]
+                    rank = top10.index(item)
+                    if conc_code in self.last_main_sectors and rank > 0:
+                        rank = max(0, rank - 1)  # 提升一个身位
+                    boosted.append((rank, item))
+                boosted.sort(key=lambda x: x[0])
+                top10 = [item for _, item in boosted]
+
+            # ── Step 2：3日涨停比例排序 → Top 3 ──
+            density_ranked = []
+            skipped_small = 0
+            for conc_code, conc_name, momentum_ret, valid_n, member_stocks in top10:
+                # 过滤：成分股不足20只的小概念不算主线
+                if len(member_stocks) < 20:
+                    skipped_small += 1
+                    continue
+                ratio = self._get_concept_limit_up_ratio(
+                    conc_code, member_stocks, date_str)
+                # 当日有效涨停数
+                hl_in_concept = [s for s in today_hl_stocks if s in member_stocks]
+                density_ranked.append({
+                    'sector_code':   conc_code,
+                    'sector_name':   conc_name,
+                    'hl_count':      len(hl_in_concept),
+                    'member_stocks': member_stocks,
+                    'hl_stocks':     hl_in_concept,
+                    'momentum_rank': top10.index((conc_code, conc_name, momentum_ret, valid_n, member_stocks)) + 1,
+                    'limit_up_ratio': round(ratio, 4),
+                })
+            if skipped_small > 0:
+                print(f'[主线识别] Step2 排除 {skipped_small} 个小概念(<20成员)')
+
+            density_ranked.sort(key=lambda x: x['limit_up_ratio'], reverse=True)
+
+            # 筛选：涨停比例 ≥ 2% 且当日涨停 ≥ 1 只，最多取 3 个
+            selected = [s for s in density_ranked
+                        if s['limit_up_ratio'] >= 0.02 and s['hl_count'] >= 1][:3]
+            if not selected:
+                # 兜底：放宽涨停率要求，但仍需当日涨停 ≥ 1 只
+                selected = [s for s in density_ranked if s['hl_count'] >= 1][:3]
+            if not selected:
+                print(f'[主线识别] 无概念满足当日涨停≥1条件，无主线')
+                self.last_main_sector = None
+                self.last_main_sectors = []
+                return result
+
+            # ── 构建返回结果 ──
+            result['has_main'] = True
+            result['sectors'] = selected
+
+            # 向后兼容字段（#1 主线）
+            result['sector_code'] = selected[0]['sector_code']
+            result['sector_name'] = selected[0]['sector_name']
+            result['hl_count']    = selected[0]['hl_count']
+
+            # 合并所有主线成分股（去重），用于 L2/L3
+            all_members = set()
+            all_hl = set()
+            for s in selected:
+                all_members.update(s['member_stocks'])
+                all_hl.update(s['hl_stocks'])
+            result['member_stocks'] = list(all_members)
+            result['hl_stocks']     = list(all_hl)
+
+            # 持久化当日主线
+            self.last_main_sectors = [s['sector_code'] for s in selected]
+            self.last_main_sector  = self.last_main_sectors[0]
+            selected_names = [s['sector_name'] for s in selected]
+            print(f'[主线识别] ✅ 选中 {len(selected)} 个主线: {selected_names}')
+
+        except Exception as e:
+            print(f'[主线识别] 异常: {e}')
+        if not result['has_main']:
+            print(f'[主线识别] 最终状态: 无主线 (candidates_checked)')
+        return result
+
+    # ──────────────────────────────────────────
+    # 内部：辅助 — 候选概念 / 加权涨幅 / 涨停比例
+    # ──────────────────────────────────────────
+
+    def _build_today_candidate_pool(self, date_str, hl_stocks, initial_set):
+        """
+        兜底候选池：仅用当日有效涨停股的概念构建候选池（不走3日窗口）。
+        用于 _get_active_candidate_concepts 返回空时的降级路径。
+        """
+        candidates = {}
+        if not hl_stocks:
+            print(f'[兜底池] hl_stocks 为空')
+            return candidates
+        try:
+            concept_info = get_concept(hl_stocks, date=date_str)
+        except Exception as e:
+            print(f'[兜底池] get_concept 异常: {e}')
+            return candidates
+        if not concept_info:
+            print(f'[兜底池] get_concept 返回空，hl_stocks前5: {hl_stocks[:5]}')
+            return candidates
+        # 诊断：打印 concept_info 结构
+        sample_keys = list(concept_info.keys())[:2]
+        sample_val = concept_info[sample_keys[0]] if sample_keys else 'N/A'
+        print(f'[兜底池] get_concept返回 {len(concept_info)} 条, '
+              f'前2 key: {sample_keys}, 第1条类型: {type(sample_val).__name__}')
+
+        concept_active = {}
+        concept_names = {}
+        not_in_info = 0
+        not_dict = 0
+        for stock in hl_stocks:
+            try:
+                if stock not in concept_info:
+                    not_in_info += 1
+                    continue
+                stock_concepts = concept_info[stock]
+                if isinstance(stock_concepts, dict):
+                    concept_list = stock_concepts.get('jq_concept', [])
+                    if not isinstance(concept_list, list):
+                        concept_list = []
+                    for concept in concept_list:
+                        if not isinstance(concept, dict):
+                            continue
+                        conc_code = concept.get('concept_code', '')
+                        if not conc_code:
+                            continue
+                        conc_name = concept.get('concept_name', conc_code)
+                        concept_active[conc_code] = concept_active.get(conc_code, 0) + 1
+                        concept_names[conc_code] = conc_name
+                else:
+                    not_dict += 1
+            except Exception:
+                continue
+        print(f'[兜底池] hl_stocks={len(hl_stocks)}, 未在concept_info中={not_in_info}, '
+              f'非dict类型={not_dict}, concept_active条目={len(concept_active)}')
+
+        filtered_out = 0
+        for conc_code in list(concept_active.keys()):
+            try:
+                raw_members = get_concept_stocks(conc_code, date=date_str)
+                if len(raw_members) > 500:
+                    filtered_out += 1
+                    continue
+                filtered = [s for s in raw_members if s in initial_set]
+                candidates[conc_code] = {
+                    'concept_name': concept_names.get(conc_code, conc_code),
+                    'active_count': concept_active[conc_code],
+                    'member_stocks': filtered,
+                }
+            except Exception:
+                continue
+        print(f'[兜底池] 过滤>500排除 {filtered_out} 个, 最终候选 {len(candidates)} 个')
+        return candidates
+
+    def _get_active_candidate_concepts(self, date_str, initial_list, initial_set):
+        """
+        获取近3日活跃概念候选池。
+        规则：近3个交易日内至少有一只非一字板涨停股的所属概念，
+        且概念成分股 ≤ 500 只。
+        Returns {concept_code: {concept_name, active_count, member_stocks}}
+        """
+        candidates = {}
+        try:
+            trade_days = get_trade_days(end_date=date_str, count=3)
+            trade_days = [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d)
+                          for d in trade_days]
+        except Exception as e:
+            print(f'[候选池] get_trade_days 失败: {e}')
+            return candidates
+
+        # 收集3日内所有有效涨停股（非一字板）
+        all_active_stocks = set()
+        for day in trade_days:
+            try:
+                hl_df = get_price(initial_list, end_date=day, frequency='daily',
+                                  fields=['close', 'high_limit', 'low'], count=1,
+                                  panel=False, fill_paused=False, skip_paused=False).dropna()
+                valid = hl_df[(hl_df['close'] == hl_df['high_limit']) &
+                              (hl_df['low'] != hl_df['high_limit'])]
+                stocks = list(valid['code']) if 'code' in valid.columns else list(valid.index)
+                all_active_stocks.update(stocks)
+            except Exception as e:
+                print(f'[候选池] get_price({day}) 失败: {e}')
+                continue
+
+        if not all_active_stocks:
+            return candidates
+
+        # 查询活跃股票的概念归属
+        try:
+            concept_info = get_concept(list(all_active_stocks), date=date_str)
+        except Exception as e:
+            print(f'[候选池] get_concept 失败: {e}')
+            concept_info = {}
+
+        if not concept_info:
+            print(f'[候选池] get_concept 返回空字典, all_active_stocks={len(all_active_stocks)}')
+            return candidates
+
+        # 统计每个概念在3日内的活跃涨停股数
+        concept_active = {}
+        concept_names = {}
+        not_in_info = 0
+        not_dict = 0
+        for stock in all_active_stocks:
+            try:
+                if stock not in concept_info:
+                    not_in_info += 1
+                    continue
+                stock_concepts = concept_info[stock]
+                if isinstance(stock_concepts, dict):
+                    concept_list = stock_concepts.get('jq_concept', [])
+                    if not isinstance(concept_list, list):
+                        concept_list = []
+                    for concept in concept_list:
+                        if not isinstance(concept, dict):
+                            continue
+                        conc_code = concept.get('concept_code', '')
+                        if not conc_code:
+                            continue
+                        conc_name = concept.get('concept_name', conc_code)
+                        concept_active[conc_code] = concept_active.get(conc_code, 0) + 1
+                        concept_names[conc_code] = conc_name
+                else:
+                    not_dict += 1
+            except Exception:
+                continue
+        print(f'[候选池] all_active={len(all_active_stocks)}, 有效={len(all_active_stocks)-not_in_info}, '
+              f'未在concept_info={not_in_info}, 非dict={not_dict}, concepts={len(concept_active)}')
+
+        # 过滤并缓存（跳过成分股>500的概念）
+        candidates_unfiltered = len(concept_active)
+        candidates_filtered_out = 0
+        for conc_code in list(concept_active.keys()):
+            try:
+                raw_members = get_concept_stocks(conc_code, date=date_str)
+                if len(raw_members) > 500:
+                    candidates_filtered_out += 1
+                    continue
+                filtered = [s for s in raw_members if s in initial_set]
+                self._concept_member_cache[conc_code] = filtered
+                candidates[conc_code] = {
+                    'concept_name': concept_names.get(conc_code, conc_code),
+                    'active_count': concept_active[conc_code],
+                    'member_stocks': filtered,
+                }
+            except Exception:
+                continue
+        print(f'[候选池] 排除 {candidates_filtered_out}/{candidates_unfiltered} 个宽泛概念(>500成分股)，'
+              f'剩余候选 {len(candidates)} 个')
+
+        return candidates
+
+    def _get_concept_weighted_return(self, concept_code, member_stocks, date_str):
+        """
+        计算概念板块的5日市值加权平均涨幅。
+        Returns (weighted_return: float, valid_count: int)
+        """
+        if not member_stocks:
+            return (0.0, 0)
+
+        # 检查缓存
+        cache_key = f'return_{concept_code}_{date_str}'
+        if cache_key in self._price_cache:
+            cached = self._price_cache[cache_key]
+            if isinstance(cached, tuple):
+                return cached
+
+        try:
+            trade_days = get_trade_days(end_date=date_str, count=5)
+        except Exception:
+            return (0.0, 0)
+
+        # 分批获取价格数据
+        batch_size = 3000
+        stock_returns = {}
+        for i in range(0, len(member_stocks), batch_size):
+            batch = member_stocks[i:i + batch_size]
+            try:
+                price_df = get_price(batch, end_date=date_str, frequency='daily',
+                                     fields=['close'], count=5,
+                                     panel=False, fill_paused=False, skip_paused=False)
+                if price_df.empty:
+                    continue
+                code_col = 'code' if 'code' in price_df.columns else None
+                for stock, grp in price_df.groupby(code_col) if code_col else price_df.groupby(level=0):
+                    closes = grp['close'].values if isinstance(grp, pd.DataFrame) else grp.values
+                    if len(closes) >= 5:
+                        ret = (closes[-1] / closes[0]) - 1.0
+                        stock_returns[stock] = float(ret)
+            except Exception:
+                continue
+
+        if not stock_returns:
+            self._price_cache[cache_key] = (0.0, 0)
+            return (0.0, 0)
+
+        valid_stocks = list(stock_returns.keys())
+
+        # 获取市值
+        weights = {}
+        try:
+            mkt_df = get_fundamentals(
+                query(valuation.code, valuation.market_cap).filter(
+                    valuation.code.in_(valid_stocks)),
+                date=date_str)
+            if not mkt_df.empty:
+                for _, row in mkt_df.iterrows():
+                    cap = row.get('market_cap', None)
+                    if cap and cap > 0:
+                        weights[row['code']] = float(cap)
+        except Exception:
+            pass
+
+        # 市值加权平均
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for stock, ret in stock_returns.items():
+            w = weights.get(stock, 1.0)  # 无市值数据则等权
+            weighted_sum += ret * w
+            total_weight += w
+
+        result = (weighted_sum / total_weight, len(valid_stocks)) if total_weight > 0 else (0.0, 0)
+        self._price_cache[cache_key] = result
+        return result
+
+    def _get_concept_limit_up_ratio(self, concept_code, member_stocks, date_str):
+        """
+        计算概念板块的3日涨停比例（含一字板/T字板/换手板）。
+        Returns float 0.0 ~ 1.0
+        """
+        if not member_stocks:
+            return 0.0
+
+        try:
+            trade_days = get_trade_days(end_date=date_str, count=3)
+            trade_days = [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d)
+                          for d in trade_days]
+        except Exception:
+            return 0.0
+
+        # 检查缓存
+        cache_key = f'limitup_{concept_code}_{date_str}'
+        if cache_key in self._price_cache:
+            return self._price_cache[cache_key]
+
+        limit_up_stocks = set()
+        batch_size = 3000
+
+        for day in trade_days:
+            for i in range(0, len(member_stocks), batch_size):
+                batch = member_stocks[i:i + batch_size]
+                try:
+                    price_df = get_price(batch, end_date=day, frequency='daily',
+                                         fields=['close', 'high_limit'], count=1,
+                                         panel=False, fill_paused=False, skip_paused=False)
+                    if price_df.empty:
+                        continue
+                    code_col = 'code' if 'code' in price_df.columns else None
+                    hl_mask = price_df['close'] == price_df['high_limit']
+                    day_stocks = set(price_df[code_col][hl_mask].tolist()) if code_col else set(
+                        price_df.index[hl_mask].tolist())
+                    limit_up_stocks.update(day_stocks)
+                except Exception:
+                    continue
+
+        ratio = len(limit_up_stocks) / len(member_stocks) if member_stocks else 0.0
+        self._price_cache[cache_key] = ratio
+        return ratio
+
+    # ──────────────────────────────────────────
+    # 内部：Step 2 L1 全局情绪
+    # ──────────────────────────────────────────
+
+    def _calc_L1(self, date_str, initial_list):
+        """
+        L1 全局市场情绪（0~10分）
+          - 沪深300涨跌幅（系统性风险）
+          - 跌停/涨停比（题材退潮，连续2日）
+          - 高位大面家数（日内回撤≥8%）
+        """
+        score          = 10
+        systemic_risk  = False
+        theme_retreat  = False
+        idx_pct        = 0.0
+        ld_hl_ratio    = 0.0
+        high_face      = 0
+
+        try:
+            # 1. 沪深300涨跌幅
+            idx_data = get_price('000300.XSHG', end_date=date_str, frequency='daily',
+                                 fields=['close'], count=2, panel=False)
+            if len(idx_data) >= 2:
+                idx_pct = idx_data['close'].iloc[-1] / idx_data['close'].iloc[-2] - 1
+            if idx_pct <= -0.025:
+                systemic_risk = True
+                self.systemic_risk_days += 1
+                score -= 4
+            else:
+                self.systemic_risk_days = 0
+                if idx_pct < -0.01:
+                    score -= 1
+
+            # 2. 跌停/涨停比
+            ld_count = _get_limit_down_count(initial_list, date_str)
+            hl_count = len(_get_hl_stocks(initial_list, date_str))
+            ld_hl_ratio = ld_count / hl_count if hl_count > 0 else 0
+            if ld_hl_ratio > 1.2:
+                score -= 3
+                # 连续2日才判定题材退潮
+                if len(self.emotion_history) >= 1:
+                    theme_retreat = True
+            elif ld_hl_ratio > 0.6:
+                score -= 1
+
+            # 3. 高位大面
+            high_face = _get_high_face_count(initial_list, date_str)
+            if high_face >= 15:
+                score -= 3
+            elif high_face >= 8:
+                score -= 1
+
+        except Exception as e:
+            print(f'[L1] 计算异常: {e}')
+
+        score = max(0, min(10, score))
+        layer = 'euphoria' if score >= 8 else ('panic' if score <= 4 else 'neutral')
+
+        return {
+            'score'        : score,
+            'layer'        : layer,
+            'systemic_risk': systemic_risk,
+            'theme_retreat': theme_retreat,
+            'idx_pct'      : round(idx_pct, 4),
+            'ld_hl_ratio'  : round(ld_hl_ratio, 4),
+            'high_face'    : high_face,
+        }
+
+    # ──────────────────────────────────────────
+    # 内部：动态阈值
+    # ──────────────────────────────────────────
+
+    def _get_dynamic_config(self, l1_score):
+        """根据 L1 分数返回动态阈值字典"""
+        coeff = {
+            'panic'   : {'drop': 0.03, 'premium': 0.01, 'limit_down':  5,
+                         'volume_ratio': 0.03, 'score': 38},
+            'neutral' : {'drop': 0.05, 'premium': 0.015,'limit_down': 10,
+                         'volume_ratio': 0.05, 'score': 45},
+            'euphoria': {'drop': 0.07, 'premium': 0.02, 'limit_down': 15,
+                         'volume_ratio': 0.07, 'score': 55},
+        }
+        layer = 'euphoria' if l1_score >= 8 else ('panic' if l1_score <= 4 else 'neutral')
+        return coeff[layer]
+
+    # ──────────────────────────────────────────
+    # 内部：Step 3 L2 主线情绪（非竞价部分）
+    # ──────────────────────────────────────────
+
+    def _calc_L2(self, date_str, initial_list, main_info, l1_result):
+        """
+        L2 主线情绪（研究13分/实盘20分，竞价7分在实盘环境计入）
+          - 如无主线：兜底 = L1×2×0.8，研究上限13/实盘上限20
+          - 梯队完整性：4分
+          - 高位炸板率偏离：4分
+          - 晋级率偏离：2分
+          - 高位大面：3分
+        """
+        tier_score  = 0
+        blast_score = 0
+        grad_score  = 0
+        hface_score = 0
+
+        if not main_info['has_main']:
+            fallback = int(l1_result['score'] * 2 * 0.8)
+            base     = max(0, min(13, fallback))
+            self._append_history(base)
+            return {
+                'score'      : base,
+                'tier_score' : 0,
+                'blast_score': 0,
+                'grad_score' : 0,
+                'hface_score': 0,
+                'note'       : '无主线，兜底分',
+            }
+
+        member_stocks = main_info['member_stocks']
+        hl_stocks     = main_info['hl_stocks']
+        score         = 0
+
+        # 1. 梯队完整性（4分）
+        try:
+            tiers = self._get_tier_count(member_stocks, date_str)
+            tier4_plus = tiers.get('tier4', 0) + tiers.get('tier5plus', 0)
+            if tier4_plus >= 3:
+                tier_score = 4
+            elif tier4_plus >= 1:
+                tier_score = 2
+            score += tier_score
+        except Exception as e:
+            print(f'[L2] 梯队计算失败: {e}')
+
+        # 2. 高位炸板率偏离（4分）
+        try:
+            blast_dev = self._get_blast_rate_dev(member_stocks, date_str)
+            if blast_dev < 0:
+                blast_score = 4
+            elif blast_dev < 0.15:
+                blast_score = 2
+            score += blast_score
+        except Exception as e:
+            print(f'[L2] 炸板率计算失败: {e}')
+
+        # 3. 晋级率偏离（2分）
+        try:
+            grad_dev = self._get_graduation_rate_dev(hl_stocks, date_str)
+            if grad_dev >= 0:
+                grad_score = 2
+            elif grad_dev >= -0.20:
+                grad_score = 1
+            score += grad_score
+        except Exception as e:
+            print(f'[L2] 晋级率计算失败: {e}')
+
+        # 4. 高位大面（3分）
+        try:
+            hf = l1_result['high_face']
+            if hf == 0:
+                hface_score = 3
+            elif hf <= 5:
+                hface_score = 1
+            elif hf >= 6 and self.sky_earth_count >= 1:
+                hface_score = -1  # 天地板额外扣分
+            score += hface_score
+        except Exception as e:
+            print(f'[L2] 高位大面计算失败: {e}')
+
+        score = max(0, min(13, score))
+        self._append_history(score)
+
+        return {
+            'score'      : score,
+            'tier_score' : tier_score,
+            'blast_score': blast_score,
+            'grad_score' : grad_score,
+            'hface_score': hface_score,
+            'note'       : ('研究环境(无竞价)，上限13分' if self.env == 'research'
+                            else '实盘环境(含竞价)，上限20分'),
+        }
+
+    def _get_tier_count(self, stocks, date_str):
+        """统计3/4/5+板梯队家数（过滤一字板）"""
+        cache_key = ('tier', date_str, tuple(sorted(stocks[:30])))
+        if cache_key in self._blast_cache:
+            return self._blast_cache[cache_key]
+        hl_list = _get_hl_stocks(stocks, date_str)
+        if not hl_list:
+            return {'tier3': 0, 'tier4': 0, 'tier5plus': 0}
+        # 过滤一字板
+        try:
+            price_df = get_price(hl_list, end_date=date_str, frequency='daily',
+                                 fields=['low', 'high_limit'], count=1,
+                                 panel=False, fill_paused=False, skip_paused=False).dropna()
+            valid_hl = list(
+                price_df[price_df['low'] != price_df['high_limit']].get(
+                    'code', price_df[price_df['low'] != price_df['high_limit']].index
+                )
+            )
+        except Exception:
+            valid_hl = hl_list
+        if not valid_hl:
+            return {'tier3': 0, 'tier4': 0, 'tier5plus': 0}
+        cdf = _get_continue_count_df(valid_hl, date_str, 7)
+        if cdf.empty:
+            result = {'tier3': 0, 'tier4': 0, 'tier5plus': 0}
+        else:
+            result = {
+                'tier3'    : int((cdf['count'] == 3).sum()),
+                'tier4'    : int((cdf['count'] == 4).sum()),
+                'tier5plus': int((cdf['count'] >= 5).sum()),
+            }
+        self._blast_cache[cache_key] = result
+        return result
+
+    def _get_blast_rate_dev(self, stocks, date_str, rolling_days=20):
+        """高位炸板率与近20日均值偏离量（正=炸板加剧，负=炸板减少）"""
+        cache_key = ('blast', date_str, tuple(sorted(stocks[:30])))
+        if cache_key in self._blast_cache:
+            return self._blast_cache[cache_key]
+        try:
+            hl_list = _get_hl_stocks(stocks, date_str)
+            if not hl_list:
+                self._blast_cache[cache_key] = 0.0
+                return 0.0
+            cdf = _get_continue_count_df(hl_list, date_str, 7)
+            high_pos = list(cdf[cdf['count'] >= 3].index) if not cdf.empty else []
+            if not high_pos:
+                self._blast_cache[cache_key] = 0.0
+                return 0.0
+            df = get_price(high_pos, end_date=date_str, frequency='daily',
+                           fields=['close', 'high', 'high_limit'],
+                           count=rolling_days + 1,
+                           panel=False, fill_paused=False, skip_paused=False).dropna()
+            if df.empty:
+                self._blast_cache[cache_key] = 0.0
+                return 0.0
+            day_rates = []
+            for _, day_df in df.groupby('time'):
+                touched = day_df[day_df['high'] == day_df['high_limit']]
+                if len(touched) == 0:
+                    continue
+                blasted = touched[touched['close'] != touched['high_limit']]
+                day_rates.append(len(blasted) / len(touched))
+            deviation = (day_rates[-1] - np.mean(day_rates[:-1])) if len(day_rates) > 1 else 0.0
+            self._blast_cache[cache_key] = deviation
+            return deviation
+        except Exception:
+            self._blast_cache[cache_key] = 0.0
+            return 0.0
+
+    def _get_graduation_rate_dev(self, hl_list, date_str, rolling_days=20):
+        """连板晋级率与近20日均值偏离量（正=晋级更多，负=晋级减少）"""
+        if not hl_list:
+            return 0.0
+        cache_key = ('grad', date_str, tuple(sorted(hl_list[:20])))
+        if cache_key in self._blast_cache:
+            return self._blast_cache[cache_key]
+        try:
+            df = get_price(hl_list, end_date=date_str, frequency='daily',
+                           fields=['close', 'high_limit'],
+                           count=rolling_days + 2,
+                           panel=False, fill_paused=False, skip_paused=False).dropna()
+            if df.empty:
+                self._blast_cache[cache_key] = 0.0
+                return 0.0
+            df['is_hl']   = df['close'] == df['high_limit']
+            code_col      = 'code' if 'code' in df.columns else None
+            trade_dates   = sorted(df['time'].unique())
+            if len(trade_dates) < 3:
+                self._blast_cache[cache_key] = 0.0
+                return 0.0
+            rates = []
+            for i in range(1, len(trade_dates)):
+                prev_df = df[df['time'] == trade_dates[i - 1]]
+                curr_df = df[df['time'] == trade_dates[i]]
+                if code_col:
+                    prev_hl = set(prev_df[prev_df['is_hl']][code_col].tolist())
+                    curr_hl = set(curr_df[curr_df['is_hl']][code_col].tolist())
+                else:
+                    prev_hl = set(prev_df[prev_df['is_hl']].index.tolist())
+                    curr_hl = set(curr_df[curr_df['is_hl']].index.tolist())
+                if not prev_hl:
+                    continue
+                rates.append(len(prev_hl & curr_hl) / len(prev_hl))
+            deviation = (rates[-1] - np.mean(rates[:-1])) if len(rates) > 1 else 0.0
+            self._blast_cache[cache_key] = deviation
+            return deviation
+        except Exception:
+            self._blast_cache[cache_key] = 0.0
+            return 0.0
+
+    def _append_history(self, score):
+        self.emotion_history.append(score)
+        if len(self.emotion_history) > 2:
+            self.emotion_history = self.emotion_history[-2:]
+
+    # ──────────────────────────────────────────
+    # 内部：Step 4 L3 龙头情绪
+    # ──────────────────────────────────────────
+
+    def _calc_L3(self, date_str, main_info):
+        """
+        L3 龙头情绪信号
+          - 龙头 = 主线板块连板数最高 + 换手率最大
+          - 断板/天地板天数触发 warning/confirm
+        """
+        result = {
+            'signal'     : 'none',
+            'dragon_stock': None,
+            'boards'     : 0,
+        }
+
+        if not main_info['has_main']:
+            # 无主线时重置断板天数防止永久禁买
+            if self.dragon_break_days > 0:
+                self.dragon_break_days = 0
+            self.dragon_stock = None
+            return result
+
+        try:
+            member_stocks = main_info['member_stocks']
+            hl_list       = _get_hl_stocks(member_stocks, date_str)
+            if not hl_list:
+                return result
+
+            cdf = _get_continue_count_df(hl_list, date_str, 10)
+            if cdf.empty:
+                return result
+
+            max_count  = cdf['count'].max()
+            top_stocks = list(cdf[cdf['count'] == max_count].index)
+
+            # 换手率最大
+            if len(top_stocks) == 1:
+                new_dragon = top_stocks[0]
+            else:
+                try:
+                    tr_df = get_fundamentals(
+                        query(valuation.turnover_ratio).filter(
+                            valuation.code.in_(top_stocks)),
+                        date=date_str)
+                    new_dragon = tr_df['turnover_ratio'].idxmax() if not tr_df.empty else top_stocks[0]
+                except Exception:
+                    new_dragon = top_stocks[0]
+
+            # 龙头切换时重置断板天数
+            if new_dragon != self.dragon_stock:
+                self.dragon_break_days = 0
+            self.dragon_stock = new_dragon
+
+            # 信号输出
+            if self.dragon_break_days >= 2 or self.sky_earth_count >= 2:
+                result['signal'] = 'confirm'
+            elif self.dragon_break_days == 1 or self.sky_earth_count == 1:
+                result['signal'] = 'warning'
+            else:
+                result['signal'] = 'none'
+
+            result['dragon_stock'] = new_dragon
+            result['boards']       = int(max_count)
+
+        except Exception as e:
+            print(f'[L3] 计算异常: {e}')
+
+        return result
+
+    def _update_dragon_break(self, date_str, main_info, l3_result):
+        """在当日收盘后更新龙头断板天数（用于下一日分析）"""
+        if not main_info['has_main'] or not self.dragon_stock:
+            return
+        try:
+            hl_today = _get_hl_stocks([self.dragon_stock], date_str)
+            if self.dragon_stock in hl_today:
+                self.dragon_break_days = 0
+            else:
+                self.dragon_break_days += 1
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────
+    # 内部：Step 6 双日确认
+    # ──────────────────────────────────────────
+
+    def _check_two_day_confirm(self, today_score, l3_signal):
+        """
+        双日退潮确认条件：
+          今日L2≤6  AND  昨日L2≤7  AND  L3信号 in (warning, confirm)
+        """
+        history        = self.emotion_history
+        yesterday_score = history[-2] if len(history) >= 2 else (history[0] if history else 13)
+
+        retreat = (
+            today_score     <= 6 and
+            yesterday_score <= 7 and
+            l3_signal in ('warning', 'confirm')
+        )
+        note = ''
+        if retreat:
+            note = f'双日退潮！L2今={today_score} 昨={yesterday_score} L3={l3_signal} → 建议清仓禁买'
+        else:
+            note = f'L2今={today_score} 昨={yesterday_score} L3={l3_signal}'
+        return {'retreat': retreat, 'note': note}
+
+    # ──────────────────────────────────────────
+    # 内部：Step 7 五档仓位
+    # ──────────────────────────────────────────
+
+    def _get_position_level(self, l2_score, l1_result):
+        """
+        五档仓位（基于 L2 分数，L1 系统性风险时强制 0 档）
+
+        研究环境 (L2 上限 13，等比缩放到 0-20)：
+        ┌──────────┬──────────┬──────────┬─────────────────────┐
+        │ L2(原始) │ 单股上限 │ 总仓上限 │ 档位说明            │
+        ├──────────┼──────────┼──────────┼─────────────────────┤
+        │  ≥11     │  25%     │  90%     │ 5档 - 全力进攻      │
+        │   8~10   │  20%     │  70%     │ 4档 - 积极配置      │
+        │   5~7    │  10%     │  30%     │ 3档 - 轻仓试探      │
+        │   3~4    │   5%     │  10%     │ 2档 - 极轻仓        │
+        │   <3     │   0%     │   0%     │ 1档 - 保持空仓      │
+        └──────────┴──────────┴──────────┴─────────────────────┘
+
+        实盘环境 (L2 上限 20，原始阈值)：
+        ┌──────────┬──────────┬──────────┬─────────────────────┐
+        │ L2(原始) │ 单股上限 │ 总仓上限 │ 档位说明            │
+        ├──────────┼──────────┼──────────┼─────────────────────┤
+        │  ≥16     │  25%     │  90%     │ 5档 - 全力进攻      │
+        │  12~15   │  20%     │  70%     │ 4档 - 积极配置      │
+        │   8~11   │  10%     │  30%     │ 3档 - 轻仓试探      │
+        │   4~7    │   5%     │  10%     │ 2档 - 极轻仓        │
+        │   <4     │   0%     │   0%     │ 1档 - 保持空仓      │
+        └──────────┴──────────┴──────────┴─────────────────────┘
+        注：L1 系统性风险强制 0 档（禁止买入）
+        """
+        if l1_result['systemic_risk']:
+            return {
+                'single_limit': 0.0,
+                'total_limit' : 0.0,
+                'level'       : 0,
+                'note'        : '☠️ L1系统性风险禁止买入',
+            }
+        # 研究环境等比缩放到 0-20 标尺（L2_max_research=13, L2_max_live=20）
+        if self.env == 'research':
+            s = l2_score * (20.0 / 13.0)
+        else:
+            s = l2_score
+
+        if s >= 16:
+            return {'single_limit': 0.25, 'total_limit': 0.90, 'level': 5,
+                    'note': '🔥 5档 - 全力进攻（单股25% / 总仓90%）'}
+        elif s >= 12:
+            return {'single_limit': 0.20, 'total_limit': 0.70, 'level': 4,
+                    'note': '📈 4档 - 积极配置（单股20% / 总仓70%）'}
+        elif s >= 8:
+            return {'single_limit': 0.10, 'total_limit': 0.30, 'level': 3,
+                    'note': '⚖️  3档 - 轻仓试探（单股10% / 总仓30%）'}
+        elif s >= 4:
+            return {'single_limit': 0.05, 'total_limit': 0.10, 'level': 2,
+                    'note': '🧊 2档 - 极轻仓（单股5% / 总仓10%）'}
+        else:
+            return {'single_limit': 0.0, 'total_limit': 0.0, 'level': 1,
+                    'note': '❌ 1档 - 保持空仓（L2过低）'}
+
+    # ──────────────────────────────────────────
+    # 内部：报告打印
+    # ──────────────────────────────────────────
+
+    def _print_report(self, result, l1, l2, l3, dyn, two_day, position, main_info):
+        sep  = '═' * 62
+        sep2 = '─' * 62
+        print(f'\n{sep}')
+        print(f'  📊 情绪周期日度报告  {result["date"]}')
+        print(sep)
+
+        # ── L1 ──
+        risk_tag   = '⚠️  系统性风险' if l1['systemic_risk'] else '正常'
+        theme_tag  = '⚠️  题材退潮'   if l1['theme_retreat']  else '正常'
+        layer_emoji = {'euphoria': '🔥 亢奋', 'neutral': '😐 中性', 'panic': '❄️  恐慌'}
+        print(f'\n【L1 全局市场情绪】  {l1["score"]:>2}/10  {layer_emoji[l1["layer"]]}')
+        print(f'  沪深300涨跌幅 : {l1["idx_pct"]:+.2%}   系统性风险: {risk_tag}')
+        print(f'  跌停/涨停比   : {l1["ld_hl_ratio"]:.2f}   题材退潮  : {theme_tag}')
+        print(f'  高位大面家数  : {l1["high_face"]:>3} 只')
+
+        # ── 动态阈值 ──
+        print(f'\n【动态阈值】  ({l1["layer"]})')
+        print(f'  止损阈值 : {dyn["drop"]:.1%}   '
+              f'竞价溢价 : {dyn["premium"]:.1%}   '
+              f'跌停容量 : {dyn["limit_down"]}只')
+        print(f'  量比阈值 : {dyn["volume_ratio"]:.1%}   '
+              f'入场评分 : {dyn["score"]}分')
+
+        # ── 主线 ──
+        print(f'\n【主线识别】')
+        if main_info['has_main'] and main_info.get('sectors'):
+            sectors = main_info['sectors']
+            total_hl  = sum(s['hl_count'] for s in sectors)
+            total_members = len(main_info['member_stocks'])
+            for i, s in enumerate(sectors, 1):
+                print(f'  ✅ 主线#{i}    : {s["sector_name"]}（{s["sector_code"]}）'
+                      f'  |  当日{s["hl_count"]}只涨停/成员{len(s["member_stocks"])}只'
+                      f'  |  动量排{s["momentum_rank"]}  |  3日涨停率{s["limit_up_ratio"]:.3f}')
+            print(f'  有效涨停数  : {total_hl} 只 / '
+                  f'合并成员 {total_members} 只')
+            tiers = self._get_tier_count(main_info['member_stocks'], result['date'])
+            print(f'  梯队分布    : 3板={tiers.get("tier3",0)}只  '
+                  f'4板={tiers.get("tier4",0)}只  '
+                  f'5板+={tiers.get("tier5plus",0)}只')
+        else:
+            print(f'  ❌ 无明显主线（活跃概念不足）')
+
+        # ── L2 ──
+        l2_max = 13 if self.env == 'research' else 20
+        l2_env_note = '研究环境，竞价7分不计' if self.env == 'research' else '实盘环境，含竞价7分'
+        l2_scaled = f'（等效 {l2["score"] * (20.0 / 13.0):.0f}/20）' if self.env == 'research' else ''
+        print(f'\n【L2 主线情绪】  {l2["score"]:>2}/{l2_max}{l2_scaled}（{l2_env_note}）')
+        print(f'  梯队完整性  : {l2["tier_score"]:>2}/4分')
+        print(f'  炸板率偏离  : {l2["blast_score"]:>2}/4分')
+        print(f'  晋级率偏离  : {l2["grad_score"]:>2}/2分')
+        print(f'  高位大面    : {l2["hface_score"]:>2}/3分')
+        print(f'  ⚠️  注：竞价溢价3分 + 竞价因子4分 需实盘/回测环境获取')
+
+        # ── L3 ──
+        l3_emoji = {'none': '✅ 无信号', 'warning': '⚠️  警告', 'confirm': '🚨 确认退出'}
+        print(f'\n【L3 龙头情绪】  {l3_emoji[l3["signal"]]}')
+        if l3['dragon_stock']:
+            name = ''
+            try:
+                name = get_security_info(l3['dragon_stock']).display_name
+            except Exception:
+                pass
+            print(f'  总龙头      : {l3["dragon_stock"]}（{name}）  '
+                  f'{l3["boards"]}连板')
+            print(f'  断板天数    : {result["dragon_break_days"]} 日   '
+                  f'天地板      : {result["sky_earth_count"]} 只')
+        else:
+            print(f'  无明确龙头（主线缺失或无连板）')
+
+        # ── 双日确认 ──
+        retreat_tag = '🚨 触发！' if two_day['retreat'] else '未触发'
+        print(f'\n【双日确认退潮】  {retreat_tag}')
+        print(f'  {two_day["note"]}')
+
+        # ── 五档仓位 ──
+        pos_scale_note = '  （研究环境 L2 已等比缩放到 0-20 标尺）' if self.env == 'research' else ''
+        print(f'\n【五档仓位建议】  第 {position["level"]} 档{pos_scale_note}')
+        print(f'  {position["note"]}')
+        if position['level'] > 0:
+            print(f'  单股上限 {position["single_limit"]:.0%}  | 总仓上限 {position["total_limit"]:.0%}')
+
+        print(f'\n{sep}\n')
+
+
+# ─────────────────────────────────────────────
+# 快捷函数（直接在 Notebook 中调用）
+# ─────────────────────────────────────────────
+
+_default_analyzer = None
+
+
+def analyze_today(date=None, verbose=True, env='research'):
+    """
+    单日快捷分析。等同于 EmotionCycleDailyAnalyzer(env=env).analyze(date)
+    注意：每次调用都会新建实例（无跨日状态传递），适合单日查看。
+    """
+    global _default_analyzer
+    _default_analyzer = EmotionCycleDailyAnalyzer(env=env)
+    if date is None:
+        # 取最近一个交易日
+        date = get_trade_days(end_date=dt.date.today().strftime('%Y-%m-%d'), count=1)[0]
+        date = date.strftime('%Y-%m-%d')
+    return _default_analyzer.analyze(date, verbose=verbose)
+
+
+def analyze_range(start_date, end_date, plot=True, env='research'):
+    """
+    区间批量分析，自动携带跨日状态（双日确认、断板天数等均正确传递）。
+    plot=True 时输出 L1/L2 折线图及仓位直方图。
+
+    Parameters
+    ----------
+    start_date : str   'YYYY-MM-DD'
+    end_date   : str   'YYYY-MM-DD'
+    plot       : bool  True = 绘图
+    env        : str   'research' | 'live'
+
+    Returns
+    -------
+    df : pd.DataFrame
+    """
+    ana = EmotionCycleDailyAnalyzer(env=env)
+    df  = ana.run_range(start_date, end_date, verbose=True)
+
+    if plot and not df.empty:
+        _plot_results(df, start_date, end_date)
+
+    return df
+
+
+def _plot_results(df, start_date, end_date):
+    """绘制情绪周期概览图"""
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib
+        matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS']
+        matplotlib.rcParams['axes.unicode_minus'] = False
+
+        fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+        fig.suptitle(f'情绪周期日度概览 {start_date} ~ {end_date}', fontsize=14)
+
+        x = range(len(df))
+        labels = [d[5:] for d in df.index]  # MM-DD 简化
+
+        def sparse_xticks(ax, step=5):
+            ax.set_xticks(list(x)[::step])
+            ax.set_xticklabels(labels[::step], rotation=45, fontsize=7)
+
+        # ── 图1 L1 & L2 分数 ──
+        ax1 = axes[0]
+        ax1.plot(x, df['L1_score'], label='L1 全局情绪', color='steelblue', linewidth=1.5)
+        ax1.plot(x, df['L2_score'], label='L2 主线情绪', color='darkorange',
+                 linewidth=1.5, linestyle='--')
+        ax1.axhline(6,  color='red',   linestyle=':', linewidth=0.8, label='L2退潮阈值=6')
+        ax1.axhline(8,  color='green', linestyle=':', linewidth=0.8, label='L1亢奋线=8')
+        ax1.set_ylabel('得分')
+        ax1.legend(fontsize=8)
+        ax1.set_ylim(0, 14)
+        sparse_xticks(ax1)
+
+        # ── 图2 L3 信号 & 双日确认 ──
+        ax2 = axes[1]
+        l3_map   = {'none': 0, 'warning': 1, 'confirm': 2}
+        l3_vals  = df['L3_signal'].map(l3_map).fillna(0)
+        color_map = {0: 'limegreen', 1: 'orange', 2: 'red'}
+        colors    = [color_map[v] for v in l3_vals]
+        ax2.bar(list(x), l3_vals, color=colors, width=0.6, label='L3信号(0无/1警告/2确认)')
+        retreat_x = [i for i, v in zip(x, df['two_day_retreat']) if v]
+        if retreat_x:
+            ax2.scatter(retreat_x, [2.2] * len(retreat_x),
+                        marker='v', color='darkred', s=60, zorder=5, label='双日退潮确认')
+        ax2.set_ylabel('L3 信号')
+        ax2.set_ylim(0, 3)
+        ax2.set_yticks([0, 1, 2])
+        ax2.set_yticklabels(['无', '警告', '确认'])
+        ax2.legend(fontsize=8)
+        sparse_xticks(ax2)
+
+        # ── 图3 五档仓位 ──
+        ax3 = axes[2]
+        pos_colors = {0: 'gray', 1: 'navy', 2: 'deepskyblue', 3: 'gold', 4: 'orange', 5: 'red'}
+        bar_colors = [pos_colors.get(v, 'gray') for v in df['pos_level']]
+        ax3.bar(list(x), df['pos_total_limit'] * 100, color=bar_colors, width=0.6)
+        ax3.set_ylabel('总仓位上限 (%)')
+        ax3.set_ylim(0, 100)
+        sparse_xticks(ax3)
+        # 图例
+        from matplotlib.patches import Patch
+        legend_items = [Patch(color=c, label=f'{k}档') for k, c in pos_colors.items()]
+        ax3.legend(handles=legend_items, fontsize=7, ncol=6, loc='upper right')
+
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f'[绘图] 失败: {e}')
+
+
+# ─────────────────────────────────────────────
+# 使用示例（在研究环境中直接运行本文件即可触发）
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+
+    # ── 示例1：单日详细报告 ──
+    print('=' * 40)
+    print('示例1：单日详细报告')
+    print('=' * 40)
+    result = analyze_today('2026-06-03')
+    result = analyze_today('2026-06-04')
+    result = analyze_today('2026-06-05')
+
+    # ── 示例2：区间批量分析 + 绘图 ──
+    print('\n示例2：区间批量分析（2026-01-01 ~ 2026-02-01）')
+    df = analyze_range('2026-06-03', '2026-06-05', plot=True)
+
+    # ── 示例3：新算法验证 ──
+    print('\n' + '=' * 60)
+    print('示例3：新主线算法验证（3个特征日期）')
+    print('=' * 60)
+    test_dates = [
+        ('2026-06-03', '高活跃日（原版输出16个概念）'),
+        ('2026-06-04', 'L1降档日（L1从10降到6）'),
+        ('2026-06-05', 'L2高分日（L2=13）'),
+    ]
+    for date_str, label in test_dates:
+        ana = EmotionCycleDailyAnalyzer()
+        r = ana.analyze(date_str, verbose=False)
+        sectors = r.get('main_sectors', [])
+        print(f'\n{"─" * 50}')
+        print(f'📅 {date_str}  {label}')
+        print(f'  主线数: {len(sectors)}')
+        for i, s in enumerate(sectors, 1):
+            print(f'    #{i}: {s["sector_name"]}({s["sector_code"]}) '
+                  f'涨停={s["hl_count"]} 动量排{s["momentum_rank"]} 涨停率={s["limit_up_ratio"]:.3f}')
+        print(f'  L1={r["L1_score"]} L2={r["L2_score"]} L3={r["L3_signal"]} 仓位={r["pos_level"]}档')
+        # 断言（仅警告，不中断）
+        warnings = []
+        if not (1 <= len(sectors) <= 3):
+            warnings.append(f'⚠️ 主线数异常: {len(sectors)}（期望1~3）')
+        if sectors and sectors[0]['sector_code'] == 'SC0104':
+            warnings.append('⚠️ #1主线是沪股通(SC0104)，可能仍是宽泛概念')
+        for s in sectors:
+            if s['limit_up_ratio'] < 0.02 and r['L2_score'] >= 8:
+                warnings.append(f'⚠️ {s["sector_name"]} 涨停率={s["limit_up_ratio"]:.3f} < 0.02 但仍入选')
+        if warnings:
+            for w in warnings:
+                print(f'  {w}')
+    print(f'\n{"─" * 50}')
+    print('✅ 新算法验证完成')
+

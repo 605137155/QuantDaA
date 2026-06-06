@@ -12,12 +12,3 @@ cooldown_minutes = 20
 enabled = true
 min_pct_chg = 3.0
 cooldown_minutes = 10
-
-[limit_up_auction]
-enabled = true
-min_required_bars = 100
-min_market_cap = 70.0
-max_market_cap = 520.0
-min_open_vol_ratio = 0.03
-cooldown_minutes = 30
-

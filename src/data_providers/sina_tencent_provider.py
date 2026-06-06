@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import urllib3
 from math import ceil
 from typing import Optional
 
 import requests
+
+# 禁用SSL警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     import akshare as ak
@@ -22,6 +26,7 @@ class SinaTencentMarketProvider:
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.proxies.clear()
+        self.session.verify = False  # 禁用SSL证书验证
         self.session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"})
         self._universe_cache: Optional[list[Stock]] = None
 

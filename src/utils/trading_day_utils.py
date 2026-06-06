@@ -4,9 +4,14 @@ from datetime import datetime
 from typing import Optional
 
 
+def is_trading_day(now: Optional[datetime] = None) -> bool:
+    current = now or datetime.now()
+    return current.weekday() < 5
+
+
 def is_trading_session(now: Optional[datetime] = None) -> bool:
     current = now or datetime.now()
-    if current.weekday() >= 5:
+    if not is_trading_day(current):
         return False
 
     hm = current.hour * 100 + current.minute

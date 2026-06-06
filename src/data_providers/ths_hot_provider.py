@@ -107,6 +107,24 @@ class THSHotProvider:
         except requests.exceptions.RequestException as e:
             raise Exception(f"请求失败: {e}")
 
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        if value in (None, ""):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        if value in (None, ""):
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     def get_hot_stocks(
         self,
         time_type: str = "hour",
@@ -137,16 +155,17 @@ class THSHotProvider:
 
         result = []
         for item in stock_list[:limit]:
+            tags = item.get('tag') or {}
             stock = THSStockHot(
                 code=item.get('code', ''),
                 name=item.get('name', ''),
-                order=item.get('order', 0),
-                rate=float(item.get('rate', 0)),
-                rise_and_fall=float(item.get('rise_and_fall', 0)),
-                hot_rank_chg=item.get('hot_rank_chg', 0),
-                market=item.get('market', 0),
-                concept_tags=item.get('tag', {}).get('concept_tag', []),
-                popularity_tag=item.get('tag', {}).get('popularity_tag', ''),
+                order=self._safe_int(item.get('order', 0)),
+                rate=self._safe_float(item.get('rate', 0)),
+                rise_and_fall=self._safe_float(item.get('rise_and_fall', 0)),
+                hot_rank_chg=self._safe_int(item.get('hot_rank_chg', 0)),
+                market=self._safe_int(item.get('market', 0)),
+                concept_tags=tags.get('concept_tag') or [],
+                popularity_tag=tags.get('popularity_tag') or '',
                 analyse=item.get('analyse'),
                 analyse_title=item.get('analyse_title')
             )
@@ -181,9 +200,9 @@ class THSHotProvider:
             plate = THSPlateHot(
                 code=item.get('code', ''),
                 name=item.get('name', ''),
-                order=item.get('order', 0),
-                rate=float(item.get('rate', 0)),
-                rise_and_fall=float(item.get('rise_and_fall', 0)),
+                order=self._safe_int(item.get('order', 0)),
+                rate=self._safe_float(item.get('rate', 0)),
+                rise_and_fall=self._safe_float(item.get('rise_and_fall', 0)),
                 lead_stock=item.get('lead_stock', {}).get('name') if item.get('lead_stock') else None
             )
             result.append(plate)

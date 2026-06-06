@@ -21,12 +21,14 @@ from src.repositories.signal_repo import SignalRepository
 from src.repositories.stock_repo import StockRepository
 from src.repositories.watchlist_repo import WatchlistRepository
 from src.services.candidate_scoring_service import CandidateScoringService
+from src.services.candidate_weight_config import load_candidate_weight_config
 from src.services.hot_score_service import HotScoreService
 from src.data_providers.ths_hot_provider import THSHotProvider
 from src.services.signal_dedupe_service import SignalDedupeService
 from src.services.stock_filter_service import StockFilterService
 from src.strategies.double_bottom import DoubleBottomStrategy
 from src.strategies.momentum_probe import MomentumProbeStrategy
+from src.strategies.limit_up_auction import LimitUpAuctionStrategy
 from src.ui.notifier import ConsoleNotifier
 from src.utils.logger import get_logger
 
@@ -59,7 +61,7 @@ def _build_historical_minute_provider(settings: dict, logger):
         return None
 
 
-def bootstrap_app(project_root: Path) -> AppRunner:
+def bootstrap_app(project_root: Path, candidate_profile_override: str = "") -> AppRunner:
     settings = load_toml(project_root / "config" / "settings.toml")
     strategy_params = load_toml(project_root / "config" / "strategy_params.toml")
 
@@ -77,7 +79,23 @@ def bootstrap_app(project_root: Path) -> AppRunner:
     watchlist_repo = WatchlistRepository(database)
     rank_snapshot_repo = RankSnapshotRepository(database)
     candidate_score_repo = CandidateScoreRepository(database)
-    candidate_scoring_service = CandidateScoringService()
+    weight_config_path = project_root / settings.get("candidate", {}).get("weights_path", "config/candidate_weights.toml")
+    candidate_weight_config = load_candidate_weight_config(weight_config_path)
+    configured_profile = candidate_profile_override or settings.get("candidate", {}).get("active_weight_profile", "auto")
+    active_weight_profile = (
+        candidate_weight_config.get("active_profile", "default")
+        if configured_profile in ("", "auto", None)
+        else configured_profile
+    )
+    model_path_str = candidate_weight_config.get("model_paths", {}).get(active_weight_profile, "")
+    model_path = (project_root / model_path_str) if model_path_str else (project_root / "config" / "candidate_model.pkl")
+    candidate_scoring_service = CandidateScoringService(
+        weight_profiles=candidate_weight_config.get("profiles", {}),
+        active_profile=active_weight_profile,
+        model_path=model_path if model_path.exists() else None,
+        model_paths=candidate_weight_config.get("model_paths", {}),
+        model_root=project_root,
+    )
 
     provider = _build_provider(settings)
     stock_filter = StockFilterService(settings["market"])
@@ -116,6 +134,8 @@ def bootstrap_app(project_root: Path) -> AppRunner:
     ]
     if strategy_params.get("momentum_probe", {}).get("enabled", False):
         strategies.append(MomentumProbeStrategy(strategy_params["momentum_probe"]))
+    if strategy_params.get("limit_up_auction", {}).get("enabled", False):
+        strategies.append(LimitUpAuctionStrategy(strategy_params["limit_up_auction"]))
 
     strategy_runner = StrategyRunner(
         provider=provider,

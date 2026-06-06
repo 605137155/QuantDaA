@@ -227,6 +227,7 @@ class CandidateScoringServiceTests(unittest.TestCase):
         rank_context = {
             "monitor_rank_yesterday": 6,
             "ths_rank_yesterday": 12,
+            "ths_value_rank_yesterday": 15,
             "kpl_rank_yesterday": 18,
         }
 
@@ -236,8 +237,18 @@ class CandidateScoringServiceTests(unittest.TestCase):
         self.assertGreaterEqual(result["total_score"], 60)
         self.assertIn(result["grade"], {"A", "B", "C"})
         self.assertTrue(result["flags"])
+        self.assertIn("同花顺价值榜#15", result["flags"])
         self.assertIn("vol_ratio_5", result["metrics"])
         self.assertIn("float_market_cap_est", result["metrics"])
+        self.assertEqual(15, result["metrics"]["ths_value_rank_yesterday"])
+        self.assertEqual(6, result["metrics"]["monitor_rank_yesterday"])
+        self.assertEqual(12, result["metrics"]["ths_rank_yesterday"])
+        self.assertEqual(18, result["metrics"]["kpl_rank_yesterday"])
+        self.assertIn("metric_monitor_rank", result["metrics"]["factor_features"])
+        self.assertIn("metric_ths_rank", result["metrics"]["factor_features"])
+        self.assertIn("metric_ths_value_rank", result["metrics"]["factor_features"])
+        self.assertIn("metric_kpl_rank", result["metrics"]["factor_features"])
+        self.assertEqual("default", result["metrics"]["weight_profile"])
 
     def test_build_intraday_ranking_uses_union_pool_and_sorts_by_score(self):
         from src.services.candidate_scoring_service import CandidateScoringService
@@ -277,6 +288,56 @@ class CandidateScoringServiceTests(unittest.TestCase):
         self.assertEqual("300308", rows[0]["stock_code"])
         self.assertGreater(rows[0]["total_score"], rows[1]["total_score"])
 
+    def test_intraday_candidate_prefers_more_upside_room(self):
+        from src.services.candidate_scoring_service import CandidateScoringService
+
+        service = CandidateScoringService()
+        bars = [
+            Candle("000001", "2026-05-26", 9.7, 10.1, 9.6, 9.9, 12000, 118800, 0.0),
+            Candle("000001", "2026-05-27", 9.9, 10.2, 9.8, 10.0, 12500, 125000, 1.01),
+            Candle("000001", "2026-05-28", 10.0, 10.3, 9.9, 10.1, 13000, 131300, 1.0),
+            Candle("000001", "2026-05-29", 10.1, 10.4, 10.0, 10.2, 13500, 137700, 0.99),
+            Candle("000001", "2026-05-30", 10.2, 10.5, 10.1, 10.3, 14000, 144200, 0.98),
+        ]
+        rank_context = {
+            "monitor_rank_today": 8,
+            "ths_rank_today": 10,
+            "ths_value_rank_today": 12,
+            "kpl_rank_today": 15,
+            "monitor_rank_yesterday": 9,
+        }
+
+        more_room = service.score_intraday_candidate(
+            "000001",
+            "平安银行",
+            bars,
+            rank_context,
+            {
+                "pct_chg": 2.0,
+                "amount": 3_000_000_000,
+                "turnover_rate": 2.0,
+                "last_price": 10.51,
+                "low": 10.20,
+            },
+        )
+        less_room = service.score_intraday_candidate(
+            "000001",
+            "平安银行",
+            bars,
+            rank_context,
+            {
+                "pct_chg": 9.0,
+                "amount": 3_000_000_000,
+                "turnover_rate": 2.0,
+                "last_price": 11.23,
+                "low": 10.80,
+            },
+        )
+
+        self.assertGreater(more_room["total_score"], less_room["total_score"])
+        self.assertGreater(more_room["metrics"]["upside_room_pct"], less_room["metrics"]["upside_room_pct"])
+        self.assertIn("上行空间偏低", less_room["risks"])
+
     def test_market_cap_score_prefers_mid_float_market_cap(self):
         from src.services.candidate_scoring_service import CandidateScoringService
 
@@ -307,6 +368,349 @@ class CandidateScoringServiceTests(unittest.TestCase):
         )
 
         self.assertGreater(preferred["market_cap_score"], too_large["market_cap_score"])
+
+    def test_candidate_scoring_service_applies_configured_weight_profile(self):
+        from src.services.candidate_scoring_service import CandidateScoringService
+
+        service = CandidateScoringService(
+            weight_profiles={
+                "optimized": {
+                    "heat_weight": 0.5,
+                    "market_cap_weight": 0.5,
+                    "volume_price_weight": 2.0,
+                    "position_weight": 1.5,
+                    "risk_weight": 1.0,
+                }
+            },
+            active_profile="optimized",
+        )
+        bars = [
+            Candle("300308", "2026-05-20", 90, 93, 89, 92, 10000, 920000, 0.0),
+            Candle("300308", "2026-05-21", 92, 94, 91, 93, 11000, 1023000, 1.09),
+            Candle("300308", "2026-05-22", 93, 95, 92, 94, 12000, 1128000, 1.08),
+            Candle("300308", "2026-05-23", 94, 97, 93, 96, 13000, 1248000, 2.13),
+            Candle("300308", "2026-05-26", 96, 99, 95, 98, 13500, 1323000, 2.08),
+            Candle("300308", "2026-05-27", 98, 102, 97, 101, 16000, 1616000, 3.06),
+            Candle("300308", "2026-05-28", 101, 106, 100, 105, 18500, 1942500, 3.96),
+            Candle("300308", "2026-05-29", 105, 109, 104, 108, 21000, 2268000, 2.86),
+            Candle("300308", "2026-05-30", 108, 113, 107, 112, 32000, 3584000, 3.70),
+        ]
+
+        result = service.score_replay_candidate(
+            "300308",
+            "中际旭创",
+            bars,
+            {"monitor_rank_yesterday": 6, "ths_rank_yesterday": 12, "kpl_rank_yesterday": 18},
+        )
+
+        self.assertEqual("optimized", result["metrics"]["weight_profile"])
+        self.assertNotEqual(
+            result["total_score"],
+            result["heat_score"] + result["market_cap_score"] + result["volume_price_score"] + result["position_score"] + result["risk_penalty"],
+        )
+
+    def test_candidate_scoring_service_applies_raw_metric_weights(self):
+        from src.services.candidate_scoring_service import CandidateScoringService
+
+        service = CandidateScoringService(
+            weight_profiles={
+                "metric_boosted": {
+                    "heat_weight": 1.0,
+                    "market_cap_weight": 1.0,
+                    "volume_price_weight": 1.0,
+                    "position_weight": 1.0,
+                    "risk_weight": 1.0,
+                    "metric_vol_ratio_5_weight": 2.0,
+                    "metric_red_green_ratio_5_weight": 0.0,
+                    "metric_close_strength_weight": 0.0,
+                    "metric_day_pct_weight": 0.0,
+                    "metric_breakout_20_weight": 0.0,
+                    "metric_bias_ma5_weight": 0.0,
+                    "metric_pos60_weight": 0.0,
+                    "metric_upper_shadow_ratio_weight": 0.0,
+                    "metric_pct3_weight": 0.0,
+                    "metric_float_market_cap_weight": 0.0,
+                }
+            },
+            active_profile="metric_boosted",
+        )
+        bars = [
+            Candle("300308", "2026-05-20", 90, 93, 89, 92, 10000, 920000, 0.0),
+            Candle("300308", "2026-05-21", 92, 94, 91, 93, 11000, 1023000, 1.09),
+            Candle("300308", "2026-05-22", 93, 95, 92, 94, 12000, 1128000, 1.08),
+            Candle("300308", "2026-05-23", 94, 97, 93, 96, 13000, 1248000, 2.13),
+            Candle("300308", "2026-05-26", 96, 99, 95, 98, 13500, 1323000, 2.08),
+            Candle("300308", "2026-05-27", 98, 102, 97, 101, 16000, 1616000, 3.06),
+            Candle("300308", "2026-05-28", 101, 106, 100, 105, 18500, 1942500, 3.96),
+            Candle("300308", "2026-05-29", 105, 109, 104, 108, 21000, 2268000, 2.86),
+            Candle("300308", "2026-05-30", 108, 113, 107, 112, 32000, 3584000, 3.70),
+        ]
+
+        result = service.score_replay_candidate("300308", "中际旭创", bars, {"monitor_rank_yesterday": 6})
+
+        self.assertGreater(result["metrics"]["weighted_total_raw"], 0)
+        self.assertIn("factor_features", result["metrics"])
+        self.assertNotEqual(0.0, result["metrics"]["factor_features"]["metric_vol_ratio_5"])
+        self.assertIn("day_amplitude", result["metrics"])
+        self.assertIn("body_ratio", result["metrics"])
+        self.assertIn("signed_body_pct", result["metrics"])
+        self.assertIn("breakout_gap_20", result["metrics"])
+        self.assertIn("amount_continuity_2d", result["metrics"])
+
+    def test_rerank_replay_rows_uses_cross_section_normalized_factor_features(self):
+        from src.services.candidate_scoring_service import CandidateScoringService
+
+        service = CandidateScoringService(
+            weight_profiles={
+                "metric_boosted": {
+                    "heat_weight": 0.0,
+                    "market_cap_weight": 0.0,
+                    "volume_price_weight": 0.0,
+                    "position_weight": 0.0,
+                    "risk_weight": 0.0,
+                    "metric_vol_ratio_5_weight": 2.0,
+                    "metric_red_green_ratio_5_weight": 0.0,
+                    "metric_close_strength_weight": 0.0,
+                    "metric_day_pct_weight": 0.0,
+                    "metric_day_amplitude_weight": 0.0,
+                    "metric_body_ratio_weight": 0.0,
+                    "metric_signed_body_pct_weight": 0.0,
+                    "metric_breakout_20_weight": 0.0,
+                    "metric_breakout_gap_20_weight": 0.0,
+                    "metric_bias_ma5_weight": 0.0,
+                    "metric_pos60_weight": 0.0,
+                    "metric_upper_shadow_ratio_weight": 0.0,
+                    "metric_pct3_weight": 0.0,
+                    "metric_amount_continuity_2d_weight": 0.0,
+                    "metric_float_market_cap_weight": 0.0,
+                }
+            },
+            active_profile="metric_boosted",
+        )
+        rows = [
+            {"stock_code": "000001", "total_score": 0, "grade": "D", "heat_score": 0, "market_cap_score": 0, "volume_price_score": 0, "position_score": 0, "risk_penalty": 0, "metrics": {"factor_features": {"metric_vol_ratio_5": -2.0}}},
+            {"stock_code": "000002", "total_score": 0, "grade": "D", "heat_score": 0, "market_cap_score": 0, "volume_price_score": 0, "position_score": 0, "risk_penalty": 0, "metrics": {"factor_features": {"metric_vol_ratio_5": 0.0}}},
+            {"stock_code": "000003", "total_score": 0, "grade": "D", "heat_score": 0, "market_cap_score": 0, "volume_price_score": 0, "position_score": 0, "risk_penalty": 0, "metrics": {"factor_features": {"metric_vol_ratio_5": 4.0}}},
+        ]
+
+        reranked = service.rerank_replay_rows(rows)
+
+        by_code = {row["stock_code"]: row for row in reranked}
+        self.assertEqual("000003", reranked[0]["stock_code"])
+        self.assertEqual(100, by_code["000003"]["total_score"])
+        self.assertEqual(50, by_code["000002"]["total_score"])
+        self.assertEqual(0, by_code["000001"]["total_score"])
+        self.assertEqual(1.0, by_code["000003"]["metrics"]["normalized_factor_features"]["metric_vol_ratio_5"])
+        self.assertEqual(0.0, by_code["000002"]["metrics"]["normalized_factor_features"]["metric_vol_ratio_5"])
+        self.assertEqual(-1.0, by_code["000001"]["metrics"]["normalized_factor_features"]["metric_vol_ratio_5"])
+
+    def test_rerank_replay_rows_batches_model_predictions(self):
+        from src.services.candidate_scoring_service import CandidateScoringService
+
+        class FakeModel:
+            def __init__(self):
+                self.batch_sizes: list[int] = []
+
+            def predict(self, rows):
+                self.batch_sizes.append(len(rows))
+                return [row[0] for row in rows]
+
+        service = CandidateScoringService()
+        service._model = FakeModel()
+        rows = [
+            {"stock_code": "000001", "total_score": 0, "grade": "D", "heat_score": 20, "market_cap_score": 0, "volume_price_score": 0, "position_score": 0, "risk_penalty": 0, "metrics": {"factor_features": {}}},
+            {"stock_code": "000002", "total_score": 0, "grade": "D", "heat_score": 40, "market_cap_score": 0, "volume_price_score": 0, "position_score": 0, "risk_penalty": 0, "metrics": {"factor_features": {}}},
+            {"stock_code": "000003", "total_score": 0, "grade": "D", "heat_score": 10, "market_cap_score": 0, "volume_price_score": 0, "position_score": 0, "risk_penalty": 0, "metrics": {"factor_features": {}}},
+        ]
+
+        reranked = service.rerank_replay_rows(rows)
+
+        self.assertEqual([3], service._model.batch_sizes)
+        self.assertEqual(["000002", "000001", "000003"], [row["stock_code"] for row in reranked])
+
+
+class CandidateWeightConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_load_candidate_weight_config_returns_default_when_missing(self):
+        from src.services.candidate_weight_config import load_candidate_weight_config
+
+        config = load_candidate_weight_config(Path(self._tmpdir.name) / "missing.toml")
+
+        self.assertEqual("default", config["active_profile"])
+        self.assertIn("default", config["profiles"])
+
+    def test_save_and_load_candidate_weight_config_round_trip(self):
+        from src.services.candidate_weight_config import load_candidate_weight_config, save_candidate_weight_config
+
+        path = Path(self._tmpdir.name) / "candidate_weights.toml"
+        original = {
+            "active_profile": "optimized_latest",
+            "model_paths": {
+                "optimized_latest": "config/candidate_model_optimized_latest.pkl",
+            },
+            "profiles": {
+                "default": {
+                    "heat_weight": 1.0,
+                    "market_cap_weight": 1.0,
+                    "volume_price_weight": 1.0,
+                    "position_weight": 1.0,
+                    "risk_weight": 1.0,
+                },
+                "optimized_latest": {
+                    "heat_weight": 0.8,
+                    "market_cap_weight": 0.6,
+                    "volume_price_weight": 1.9,
+                    "position_weight": 1.4,
+                    "risk_weight": 1.1,
+                },
+            },
+        }
+
+        save_candidate_weight_config(path, original)
+        loaded = load_candidate_weight_config(path)
+
+        self.assertEqual("optimized_latest", loaded["active_profile"])
+        self.assertAlmostEqual(1.9, loaded["profiles"]["optimized_latest"]["volume_price_weight"])
+        self.assertEqual(
+            "config/candidate_model_optimized_latest.pkl",
+            loaded["model_paths"]["optimized_latest"],
+        )
+
+
+class CandidateWeightOptimizerTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_optimize_replay_weights_writes_optimized_profile(self):
+        from src.services.candidate_weight_optimizer import CandidateWeightOptimizer
+        from src.services.candidate_weight_config import load_candidate_weight_config
+
+        csv_path = Path(self._tmpdir.name) / "replay_training.csv"
+        csv_path.write_text(
+            "\n".join(
+                [
+                    "trade_date,session_type,rank_no,stock_code,stock_name,total_score,grade,heat_score,market_cap_score,volume_price_score,position_score,risk_penalty,label_live_pct",
+                    "2026-06-01,replay,1,000001,平安银行,80,B,20,10,12,8,-2,5.0",
+                    "2026-06-01,replay,2,000002,万科A,70,B,18,8,10,7,-3,3.0",
+                    "2026-06-01,replay,3,000003,国农科技,60,C,16,6,8,6,-4,2.0",
+                    "2026-06-01,replay,4,000004,国华网安,50,D,12,2,5,3,-6,-1.0",
+                    "2026-06-01,replay,5,000005,世纪星源,40,D,8,0,4,2,-8,-3.0",
+                    "2026-06-01,replay,6,000006,深振业A,75,B,19,9,11,7,-2,4.0",
+                    "2026-06-01,replay,7,000007,全新好,55,C,14,4,7,5,-5,1.0",
+                    "2026-06-01,replay,8,000008,神州高铁,65,C,17,7,9,6,-3,2.5",
+                    "2026-06-01,replay,9,000009,中国宝安,45,D,10,1,4,2,-7,-2.0",
+                    "2026-06-01,replay,10,000010,美丽生态,35,D,6,0,3,1,-9,-4.0",
+                ]
+            ),
+            encoding="utf-8-sig",
+        )
+        weight_path = Path(self._tmpdir.name) / "candidate_weights.toml"
+
+        result = CandidateWeightOptimizer().optimize_replay_weights(
+            csv_path=csv_path,
+            weight_config_path=weight_path,
+            profile_name="optimized_test",
+            activate_profile=True,
+        )
+        saved = load_candidate_weight_config(weight_path)
+
+        self.assertEqual("optimized_test", result.profile_name)
+        self.assertEqual(10, result.sample_count)
+        self.assertEqual("optimized_test", saved["active_profile"])
+        self.assertIn("default", saved["profiles"])
+        self.assertIn("optimized_test", saved["profiles"])
+        self.assertEqual(
+            "config/candidate_model_optimized_test.pkl",
+            saved["model_paths"]["optimized_test"],
+        )
+        self.assertTrue((Path(self._tmpdir.name) / "config" / "candidate_model_optimized_test.pkl").exists())
+
+    def test_optimize_replay_weights_prefers_next_day_pct_as_label(self):
+        from src.services.candidate_weight_optimizer import CandidateWeightOptimizer
+
+        csv_path = Path(self._tmpdir.name) / "replay_training_next_day.csv"
+        csv_path.write_text(
+            "\n".join(
+                [
+                    "trade_date,session_type,rank_no,stock_code,stock_name,total_score,grade,heat_score,market_cap_score,volume_price_score,position_score,risk_penalty,next_day_pct,label_live_pct",
+                    "2026-06-02,replay,1,000001,平安银行,80,B,20,10,12,8,-2,6.0,-8.0",
+                    "2026-06-02,replay,2,000002,万科A,70,B,18,8,10,7,-3,3.0,-6.0",
+                    "2026-06-02,replay,3,000003,国农科技,60,C,16,6,8,6,-4,1.0,-4.0",
+                    "2026-06-02,replay,4,000004,国华网安,50,D,12,2,5,3,-6,-2.0,7.0",
+                    "2026-06-02,replay,5,000005,世纪星源,40,D,8,0,4,2,-8,-5.0,9.0",
+                ]
+            ),
+            encoding="utf-8-sig",
+        )
+        weight_path = Path(self._tmpdir.name) / "candidate_weights.toml"
+
+        result = CandidateWeightOptimizer().optimize_replay_weights(
+            csv_path=csv_path,
+            weight_config_path=weight_path,
+            profile_name="optimized_next_day_test",
+            activate_profile=False,
+        )
+
+        self.assertGreater(result.optimized_top10_avg_pct, 0.0)
+
+    def test_load_samples_normalizes_labels_by_board_limit(self):
+        from src.services.candidate_weight_optimizer import CandidateWeightOptimizer
+
+        csv_path = Path(self._tmpdir.name) / "replay_training_normalized.csv"
+        csv_path.write_text(
+            "\n".join(
+                [
+                    "trade_date,session_type,rank_no,stock_code,stock_name,total_score,grade,heat_score,market_cap_score,volume_price_score,position_score,risk_penalty,next_day_pct",
+                    "2026-06-01,replay,1,000001,平安银行,80,B,20,10,12,8,-2,10.0",
+                    "2026-06-01,replay,2,300001,特锐德,70,B,18,8,10,7,-3,20.0",
+                    "2026-06-01,replay,3,688001,华兴源创,60,C,16,6,8,6,-4,20.0",
+                    "2026-06-01,replay,4,000002,万科A,50,D,12,2,5,3,-6,-10.0",
+                ]
+            ),
+            encoding="utf-8-sig",
+        )
+
+        samples = CandidateWeightOptimizer()._load_samples(csv_path)
+
+        self.assertEqual(10.0, samples[0]["label_raw_pct"])
+        self.assertEqual(10.0, samples[0]["label_pct"])
+        self.assertEqual(20.0, samples[1]["label_raw_pct"])
+        self.assertEqual(10.0, samples[1]["label_pct"])
+        self.assertEqual(20.0, samples[2]["label_raw_pct"])
+        self.assertEqual(10.0, samples[2]["label_pct"])
+        self.assertEqual(-10.0, samples[3]["label_pct"])
+
+    def test_normalize_label_pct_treats_limit_up_as_same_strength_across_boards(self):
+        from src.services.candidate_weight_optimizer import CandidateWeightOptimizer
+
+        optimizer = CandidateWeightOptimizer()
+
+        self.assertEqual(10.0, optimizer._normalize_label_pct(10.0, "000001", "平安银行"))
+        self.assertEqual(10.0, optimizer._normalize_label_pct(20.0, "300001", "特锐德"))
+        self.assertEqual(10.0, optimizer._normalize_label_pct(20.0, "688001", "华兴源创"))
+        self.assertEqual(10.0, optimizer._normalize_label_pct(5.0, "600001", "*ST测试"))
+        self.assertEqual(10.0, optimizer._normalize_label_pct(30.0, "830001", "北交测试"))
+
+    def test_topn_objective_rewards_higher_spearman_when_top10_equal(self):
+        from src.services.candidate_weight_optimizer import CandidateWeightOptimizer
+
+        optimizer = CandidateWeightOptimizer()
+        labels = [10.0, 8.0, 6.0, 4.0, 2.0]
+        perfectly_ranked_scores = [5.0, 4.0, 3.0, 2.0, 1.0]
+        reversed_scores = [1.0, 2.0, 3.0, 4.0, 5.0]
+
+        good_objective = optimizer._topn_objective(perfectly_ranked_scores, labels, topn=5)
+        bad_objective = optimizer._topn_objective(reversed_scores, labels, topn=5)
+
+        self.assertGreater(good_objective, bad_objective)
 
 
 if __name__ == "__main__":
