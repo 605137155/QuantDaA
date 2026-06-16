@@ -12,6 +12,15 @@ import math
 import datetime
 from datetime import datetime as dt
 
+CONDITION_RULES = [
+    ('A: 昨日成交额1~5亿 | 竞价涨幅7~9% | 竞昨比10~20%',  1.07, 1.09, 0.10, 0.20),
+    ('B: 昨日成交额5~15亿 | 竞价涨幅7~9% | 竞昨比10~20%', 1.07, 1.09, 0.10, 0.20),
+    ('C: 昨日成交额5~15亿 | 竞价涨幅4~7% | 竞昨比3~7%',   1.04, 1.07, 0.03, 0.07),
+    ('D: 昨日成交额5~15亿 | 竞价涨幅4~7% | 竞昨比10~20%', 1.04, 1.07, 0.10, 0.20),
+    ('E: 昨日成交额5~15亿 | 竞价涨幅0~4% | 竞昨比3~7%',   1.00, 1.04, 0.03, 0.07),
+    ('F: 昨日成交额5~15亿 | 竞价涨幅0~4% | 竞昨比7~10%',  1.00, 1.04, 0.07, 0.10),
+]
+
 # ==================== 1. 初始化设置 ====================
 def initialize(context):
     # 设置回测参数
@@ -31,13 +40,22 @@ def initialize(context):
     
     # 策略全局变量
     g.max_stocks = 4          # 最大持仓股票数
-    g.target_list = []        # 每日目标买入列表
+    g.pre_target_count = 12    # 盘前候选池数量，竞价确认后再收敛到最多4只
+    g.target_list = []        # 兼容日志展示：盘前候选列表
+    g.pre_target_list = []    # 盘前高分候选列表
+    g.pre_target_score_dict = {}  # 盘前原始得分，竞价后综合重排使用
+    g.final_buy_list = []     # 09:26竞价确认后的最终买入列表
+    g.auction_info = {}       # 竞价命中条件记录
+    g.hold_days = 2           # 买入后持有满2个交易日，第三个交易日尾盘卖出
+    g.buy_date_dict = {}      # 记录每只持仓的买入日期
     g.limit_ups_dict = {}     # 缓存个股近10日涨停次数
     
     # 定时运行：
-    # 1. 每天早上 9:30 执行早盘买入逻辑
+    # 1. 每天 09:26 执行竞价确认逻辑
+    run_daily(my_auction_confirm, time='09:26')
+    # 2. 每天早上 9:30 执行早盘买入逻辑
     run_daily(my_morning_trade, time='open')
-    # 2. 每天下午 14:50 执行尾盘清仓逻辑（只安排出货，不买入）
+    # 3. 每天下午 14:50 执行尾盘清仓逻辑（只安排出货，不买入）
     run_daily(my_afternoon_trade, time='14:50')
 
 # ==================== 2. 每日交易前准备（选股阶段） ====================
@@ -77,6 +95,9 @@ def before_trading_start(context):
     
     if not candidate_pool:
         g.target_list = []
+        g.pre_target_list = []
+        g.pre_target_score_dict = {}
+        g.final_buy_list = []
         return
         
     name_dict = dict(zip(all_stocks_df.index, all_stocks_df['display_name']))
@@ -169,6 +190,14 @@ def before_trading_start(context):
         metrics['volatility_5'] = volatility_5
         metrics['limit_ups_5'] = limit_ups_5
         # ==============================================================================
+
+        # 首板1进2式过热硬过滤：避免筹码断层、短期波动过热和末端接力
+        if extreme_limit_ups >= 3:
+            continue
+        if volatility_5 > 40.0:
+            continue
+        if limit_ups_5 >= 4:
+            continue
 
         circ_cap = cap_dict.get(code, 0.0) # 单位：亿
         
@@ -274,25 +303,245 @@ def before_trading_start(context):
     for i, item in enumerate(scored_candidates[:10]):
         log.info(f"Top {i+1}: {item['code']} ({item['name']}) - 得分: {item['score']} (EMA趋势分: {item['ema_score']})")
         
-    # 筛选前 g.max_stocks 的股票作为买入目标
-    g.target_list = [item['code'] for item in scored_candidates][:g.max_stocks]
-    log.info(f"今日最终确定的目标买入股票：{g.target_list}")
+    # 筛选前 g.pre_target_count 的股票作为盘前候选，等待 09:26 竞价确认
+    pre_candidates = scored_candidates[:g.pre_target_count]
+    g.pre_target_list = [item['code'] for item in pre_candidates]
+    g.pre_target_score_dict = {item['code']: item['score'] for item in pre_candidates}
+    g.target_list = g.pre_target_list[:]
+    g.final_buy_list = []
+    log.info(f"今日盘前候选股票（等待竞价确认）：{g.pre_target_list}")
 
 # ==================== 3. 交易执行 ====================
+def match_auction_condition(cur_ratio, auction_ratio, yesterday_money):
+    """匹配首板1进2的集合竞价确认规则。"""
+    is_1_5 = 1e8 <= yesterday_money < 5e8
+    is_5_15 = 5e8 <= yesterday_money <= 15e8
+    for cond_name, open_lo, open_hi, auc_lo, auc_hi in CONDITION_RULES:
+        if cond_name.startswith('A') and not is_1_5:
+            continue
+        if not cond_name.startswith('A') and not is_5_15:
+            continue
+        if open_lo < cur_ratio <= open_hi and auc_lo <= auction_ratio <= auc_hi:
+            return cond_name
+    return None
+
+
+def select_confirmed_buys(pre_targets, confirmed_codes, max_stocks):
+    """保留盘前评分顺序；严格竞价无命中时回退到原策略 TopN。"""
+    confirmed_set = set(confirmed_codes)
+    strict_list = [code for code in pre_targets if code in confirmed_set][:max_stocks]
+    if strict_list:
+        return strict_list
+    return list(pre_targets)[:max_stocks]
+
+
+def calc_auction_score(cur_ratio, auction_ratio, yesterday_money, left_volume_ok, matched_condition):
+    """将首板1进2的竞价确认条件转成可参与排序的加减分。"""
+    score = 0
+
+    if matched_condition:
+        score += 35
+
+    if 1e8 <= yesterday_money <= 15e8:
+        score += 8
+    else:
+        score -= 8
+
+    if left_volume_ok:
+        score += 10
+    else:
+        score -= 6
+
+    if 1.00 < cur_ratio <= 1.04:
+        score += 8
+    elif 1.04 < cur_ratio <= 1.07:
+        score += 12
+    elif 1.07 < cur_ratio <= 1.09:
+        score += 15
+    elif 1.09 < cur_ratio <= 1.10:
+        score += 6
+    elif cur_ratio <= 1.00:
+        score -= 8
+    else:
+        score -= 12
+
+    if 0.03 <= auction_ratio <= 0.07:
+        score += 10
+    elif 0.07 < auction_ratio <= 0.20:
+        score += 12
+    elif 0.01 <= auction_ratio < 0.03:
+        score += 3
+    elif auction_ratio > 0.30:
+        score -= 8
+    else:
+        score -= 5
+
+    return max(-30, min(80, score))
+
+
+def select_final_buys_by_score(pre_targets, base_scores, auction_scores, max_stocks):
+    """按盘前得分 + 竞价得分综合重排，保留原始顺序作为同分兜底。"""
+    order = {code: idx for idx, code in enumerate(pre_targets)}
+
+    def rank_key(code):
+        final_score = base_scores.get(code, 0) + auction_scores.get(code, 0)
+        return (-final_score, order.get(code, 999))
+
+    return sorted(pre_targets, key=rank_key)[:max_stocks]
+
+
+def _normalize_trade_date(value):
+    if hasattr(value, 'date'):
+        value = value.date()
+    if isinstance(value, datetime.date):
+        return value
+    return dt.strptime(str(value)[:10], '%Y-%m-%d').date()
+
+
+def should_sell_after_hold_days(buy_date, current_date, trade_days, hold_days=2):
+    """买入日后的第 hold_days 个交易日尾盘允许卖出。"""
+    if buy_date is None or current_date is None:
+        return False
+
+    buy_day = _normalize_trade_date(buy_date)
+    current_day = _normalize_trade_date(current_date)
+    normalized_days = [_normalize_trade_date(day) for day in trade_days]
+
+    if buy_day not in normalized_days or current_day not in normalized_days:
+        return False
+
+    return normalized_days.index(current_day) - normalized_days.index(buy_day) >= hold_days
+
+
+def my_auction_confirm(context):
+    """09:26 集合竞价确认：只从盘前高分候选里挑资金承接较好的票。"""
+    pre_targets = list(g.pre_target_list)
+    base_scores = dict(getattr(g, 'pre_target_score_dict', {}))
+    auction_scores = {code: 0 for code in pre_targets}
+    g.final_buy_list = []
+    g.auction_info = {}
+
+    if not pre_targets:
+        log.info("【竞价确认】盘前候选列表为空，今日不买入")
+        return
+
+    y_day = context.previous_date.strftime('%Y-%m-%d')
+    t_day = context.current_dt.strftime("%Y-%m-%d")
+    start = t_day + ' 09:15:00'
+    end = t_day + ' 09:26:00'
+    current_data = get_current_data()
+
+    try:
+        prev_df = get_price(
+            pre_targets, end_date=y_day, frequency='daily',
+            fields=['close', 'volume', 'money'], count=1, panel=False,
+            fill_paused=False, skip_paused=True
+        )
+        prev_map = {row['code']: row for _, row in prev_df.iterrows()}
+    except Exception as e:
+        log.warn(f"【竞价确认】获取昨日行情失败：{str(e)}")
+        return
+
+    try:
+        val_df = get_fundamentals(
+            query(valuation.code, valuation.market_cap, valuation.circulating_market_cap)
+            .filter(valuation.code.in_(pre_targets)),
+            date=str(y_day)[:10]
+        )
+        val_map = {row['code']: row for _, row in val_df.iterrows()} if not val_df.empty else {}
+    except Exception as e:
+        log.warn(f"【竞价确认】获取市值数据失败：{str(e)}")
+        val_map = {}
+
+    confirmed_codes = []
+    for stock in pre_targets:
+        try:
+            price_info = current_data[stock]
+            if price_info.paused:
+                auction_scores[stock] = -30
+                continue
+
+            prev = prev_map.get(stock)
+            if prev is None:
+                continue
+
+            prev_close = float(prev['close'])
+            prev_volume = float(prev['volume'])
+            yesterday_money = float(prev['money'])
+            if prev_close <= 0 or prev_volume <= 0:
+                auction_scores[stock] = -30
+                continue
+
+            open_price = float(price_info.day_open or price_info.last_price)
+            if open_price <= 3:
+                auction_scores[stock] = -30
+                continue
+
+            market_penalty = 0
+            val = val_map.get(stock)
+            if val is not None:
+                if val['market_cap'] < 10 or val['circulating_market_cap'] > 520:
+                    market_penalty -= 8
+
+            zyts = calculate_zyts(stock, context)
+            vol_data = attribute_history(stock, zyts, '1d', fields=['volume'], skip_paused=True)
+            left_volume_ok = len(vol_data) >= 2 and vol_data['volume'][-1] > max(vol_data['volume'][:-1]) * 0.9
+
+            auction = get_call_auction(stock, start_date=start, end_date=end, fields=['time', 'volume', 'current'])
+            if auction.empty:
+                continue
+
+            auction_price = float(auction['current'].iloc[-1])
+            auction_volume = float(auction['volume'].iloc[-1])
+            cur_ratio = auction_price / prev_close
+            auction_ratio = auction_volume / prev_volume
+            matched_condition = match_auction_condition(cur_ratio, auction_ratio, yesterday_money)
+            auction_score = calc_auction_score(cur_ratio, auction_ratio, yesterday_money, left_volume_ok, matched_condition) + market_penalty
+            auction_scores[stock] = auction_score
+
+            if matched_condition is not None:
+                confirmed_codes.append(stock)
+            g.auction_info[stock] = {
+                'condition': matched_condition,
+                'cur_ratio': cur_ratio,
+                'auction_ratio': auction_ratio,
+                'yesterday_money': yesterday_money,
+                'left_volume_ok': left_volume_ok,
+                'auction_score': auction_score,
+                'base_score': base_scores.get(stock, 0),
+                'final_score': base_scores.get(stock, 0) + auction_score,
+            }
+            if matched_condition is not None:
+                log.info(f"【竞价确认通过】{stock} 命中：{matched_condition}，竞价涨幅={(cur_ratio - 1):.2%}，竞昨比={auction_ratio:.2%}，竞价分={auction_score}")
+        except Exception as e:
+            log.warn(f"【竞价确认异常】{stock}: {str(e)}")
+
+    g.final_buy_list = select_final_buys_by_score(pre_targets, base_scores, auction_scores, g.max_stocks)
+    if not confirmed_codes and g.final_buy_list:
+        log.info("【竞价确认重排】严格首板竞价确认 0 只，使用盘前得分 + 竞价得分综合排序")
+    log.info("【竞价后综合排行】" + str([
+        (code, base_scores.get(code, 0), auction_scores.get(code, 0), base_scores.get(code, 0) + auction_scores.get(code, 0))
+        for code in g.final_buy_list
+    ]))
+    log.info(f"【竞价确认结果】通过 {len(confirmed_codes)} 只，最终买入列表：{g.final_buy_list}")
+
+
 def my_morning_trade(context):
     """早盘9:30一次性全仓买入逻辑"""
-    if not g.target_list:
+    buy_list = g.final_buy_list
+    if not buy_list:
+        log.info("【早盘买入跳过】竞价确认通过列表为空，今日不买入")
         return
         
     # 获取可用现金，扣除 1% 摩擦损耗缓冲，等权平分给目标股
     available_cash = context.portfolio.available_cash * 0.99
-    cash_per_stock = available_cash / len(g.target_list)
+    cash_per_stock = available_cash / len(buy_list)
         
     if cash_per_stock <= 0:
         log.info("【早盘买入跳过】当前账户可用资金不足，放弃早盘买入")
         return
         
-    for stock in g.target_list:
+    for stock in buy_list:
         current_data = get_current_data()
         price_info = current_data[stock]
         if price_info.paused:
@@ -335,6 +584,7 @@ def my_morning_trade(context):
             
         # 一次性买入全额资金
         order_value(stock, cash_per_stock)
+        g.buy_date_dict[stock] = context.current_dt.date()
         log.info(f"【早盘买入】{stock} 买入资金 {cash_per_stock:.2f}")
 
 def my_afternoon_trade(context):
@@ -345,7 +595,20 @@ def my_afternoon_trade(context):
     for stock in current_holdings:
         position = context.portfolio.positions[stock]
         if position.closeable_amount > 0:
+            buy_date = g.buy_date_dict.get(stock)
+            today = context.current_dt.date()
+            if buy_date is None:
+                g.buy_date_dict[stock] = today
+                log.info(f"【尾盘持有】{stock} 未找到买入日期记录，今日开始记录持仓日期")
+                continue
+
+            trade_days = get_trade_days(start_date=buy_date, end_date=today)
+            if not should_sell_after_hold_days(buy_date, today, trade_days, g.hold_days):
+                log.info(f"【尾盘持有】{stock} 买入日 {buy_date}，未满 {g.hold_days} 个交易日，继续持有")
+                continue
+
             order(stock, -position.closeable_amount)
+            g.buy_date_dict.pop(stock, None)
             log.info(f"【尾盘出货】{stock} 卖出清理持仓股数 {position.closeable_amount}")
 
 # ==================== 4. 辅助特征计算函数 ====================
@@ -559,6 +822,13 @@ def calc_ma_cohesion_score(close_seq):
         return 3.0
         
     return 0.0
+
+def calculate_zyts(stock, context):
+    """计算突破前高所需观察天数，用于左侧量能校验。"""
+    high_prices = attribute_history(stock, 101, '1d', fields=['high'], skip_paused=True)['high']
+    prev_high = high_prices.iloc[-1]
+    zyts_0 = next((i - 1 for i, high in enumerate(high_prices[-3::-1], 2) if high >= prev_high), 100)
+    return zyts_0 + 5
 
 def calc_ema_alignment_score(close_seq):
     """

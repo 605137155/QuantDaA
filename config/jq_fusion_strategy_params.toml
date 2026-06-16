@@ -1,0 +1,81 @@
+# ========================================================================
+# 首板与断板反包竞价融合策略 - 本地版参数配置
+# ========================================================================
+
+[meta]
+display_name = "首板断板融合竞价"
+enabled = true
+
+# -------------------- 形态筛选条件 --------------------
+[selection]
+limit_up_ratio = 0.998             # 涨停比例阈值
+min_yesterday_close_ratio = 0.95   # 断板反包跌幅上限（5%）
+lookback_days = 8                  # 形态回看天数
+
+# -------------------- 过滤参数 --------------------
+[filter]
+max_extreme_limit_10d = 3          # 10日内一字/T字涨停上限
+max_volatility_5d = 0.40           # 5日最大波动率
+max_limit_days_5d = 4              # 5日涨停天数上限
+high_point_ratio = 0.90            # 百日高位过滤比例
+high_point_days = 100              # 高位回看天数
+
+# -------------------- 基础过滤参数 --------------------
+[filter_params]
+min_cap = 10                       # 最小总市值(亿)
+max_cap = 1200                     # 最大流通市值(亿)
+min_amount = 1.0                   # 最小成交额(亿)
+max_amount = 100.0                 # 最大成交额(亿)
+min_price = 3.0                    # 最低股价
+min_avg_chg = 0.035                # 最低VWAP涨幅(首板硬度)
+obi_min = 0.6                      # OBI最低阈值
+
+# -------------------- Setup 1 竞价规则 --------------------
+# cur_ratio = (开盘价 - 昨收) / 昨收
+# vol_ratio = 今日成交量 / 昨日成交量
+[auction_rules_setup1]
+rules = [
+    {name="E: 一字板 竞价>=9.8%", open_lo=0.098, open_hi=0.11, vol_lo=0.005, vol_hi=1.0},
+    {name="A: 竞价高开7~9%",     open_lo=0.07,  open_hi=0.098, vol_lo=0.025, vol_hi=0.25},
+    {name="B: 竞价高开4~7%",     open_lo=0.04,  open_hi=0.07,  vol_lo=0.02,  vol_hi=0.25},
+    {name="C: 竞价平开至小高开0~4%", open_lo=0.00, open_hi=0.04, vol_lo=0.015, vol_hi=0.15},
+]
+
+# -------------------- Setup 2 竞价规则 --------------------
+[auction_rules_setup2]
+rules = [
+    {name="反包E: 竞价高开8~12%",      open_lo=0.08,  open_hi=0.12,  vol_lo=0.005, vol_hi=0.25},
+    {name="反包A: 竞价高开4~8%",       open_lo=0.04,  open_hi=0.08,  vol_lo=0.005, vol_hi=0.20},
+    {name="反包B: 竞价高开2~4%",       open_lo=0.02,  open_hi=0.04,  vol_lo=0.005, vol_hi=0.15},
+    {name="反包C: 竞价平开至小高开0~2%", open_lo=0.00,  open_hi=0.02,  vol_lo=0.005, vol_hi=0.12},
+    {name="反包D: 竞价低开-3~0%",      open_lo=-0.03, open_hi=0.00,  vol_lo=0.005, vol_hi=0.12},
+    {name="反包F: 深低开-5~-3%",       open_lo=-0.05, open_hi=-0.03, vol_lo=0.005, vol_hi=0.10},
+]
+
+# -------------------- 打分权重 --------------------
+[scoring]
+w_open_gap = 1.2                   # 开盘涨幅权重
+w_vol_ratio = 0.8                  # 量比权重
+w_turnover_gap = 1.5               # 换手率×涨幅（弱转强因子）权重
+w_amount_score = 2.0               # 成交额得分权重
+bonus_yizi = 15.0                  # 一字板加分
+bonus_high_open = 12.0             # 高开反包加分(>=8%)
+bonus_deep_low = 5.0               # 深低开反包加分(<-3%)
+
+# -------------------- 自选涨幅因子 --------------------
+[tracked_bonus]
+tier_40 = 10.0                     # >= 40% 涨幅加分
+tier_30 = 15.0                     # 30~40% 涨幅加分
+tier_20 = 20.0                     # 20~30% 涨幅加分（甜蜜区间）
+tier_10 = 10.0                     # 10~20% 涨幅加分
+tier_5 = 5.0                       # 5~10% 涨幅加分
+
+# -------------------- 风控参数 --------------------
+[risk]
+max_buy_count = 2                  # 每日最大买入数
+drop_percent = 0.05                # 跌幅止损
+ma5_buffer = 0.02                  # MA5止损缓冲
+
+# -------------------- 追踪参数 --------------------
+[tracking]
+max_tracking_days = 10             # 排行榜最大追踪天数

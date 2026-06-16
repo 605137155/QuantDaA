@@ -2,6 +2,8 @@
 timezone = "Asia/Shanghai"
 demo_mode = false
 ignore_env_proxy = true
+enable_auto_open_fusion_window = true
+
 
 [database]
 path = "data/app.db"

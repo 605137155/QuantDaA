@@ -1,0 +1,52 @@
+# 首板1进2策略参数配置（自动保存）
+
+[meta]
+enabled = true
+display_name = "竞价1进2"
+
+[selection]
+min_yesterday_pct = 0.07
+min_money = 100000000
+max_money = 1500000000
+min_market_cap = 10
+max_circ_cap = 520
+min_price = 3.0
+min_avg_chg = 0.07
+
+[filter]
+max_limit_days_5 = 4
+max_extreme_limit_10 = 3
+max_volatility_5 = 0.4
+high_point_ratio = 0.9
+
+[auction_rules]
+money_split = 500000000
+
+a_rules = [
+    { name = "A: 涨幅7~9% | 竞昨比10~20%", open_lo = 1.07, open_hi = 1.09, auc_lo = 0.1, auc_hi = 0.2 },
+]
+
+b_rules = [
+    { name = "B: 涨幅7~9% | 竞昨比10~20%", open_lo = 1.07, open_hi = 1.09, auc_lo = 0.1, auc_hi = 0.2 },
+    { name = "B: 涨幅4~7% | 竞昨比3~7%", open_lo = 1.04, open_hi = 1.07, auc_lo = 0.03, auc_hi = 0.07 },
+    { name = "B: 涨幅4~7% | 竞昨比10~20%", open_lo = 1.04, open_hi = 1.07, auc_lo = 0.1, auc_hi = 0.2 },
+    { name = "B: 涨幅0~4% | 竞昨比3~7%", open_lo = 1.0, open_hi = 1.04, auc_lo = 0.03, auc_hi = 0.07 },
+    { name = "B: 涨幅0~4% | 竞昨比7~10%", open_lo = 1.0, open_hi = 1.04, auc_lo = 0.07, auc_hi = 0.1 },
+]
+
+[risk]
+drop_stop_loss = 0.05
+drawdown_threshold = 0.08
+consecutive_loss_pause = 2
+ml_skip_threshold = 0.7
+ml_reduce_threshold = 0.5
+ml_sample_window = 120
+ml_min_samples = 60
+ma5_stop_loss_buffer = 0.05
+
+[trading]
+slippage = 0.005
+open_commission = 0.0002
+close_commission = 0.0002
+close_tax = 0.0005
+min_commission = 5

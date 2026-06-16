@@ -8,11 +8,19 @@ try:
 except ModuleNotFoundError:
     tomllib = None
 
+try:
+    import tomli
+except ModuleNotFoundError:
+    tomli = None
+
 
 def load_toml(path: Path) -> dict:
     if tomllib is not None:
         with path.open("rb") as handle:
             return tomllib.load(handle)
+    if tomli is not None:
+        with path.open("rb") as handle:
+            return tomli.load(handle)
     return _load_simple_toml(path)
 
 

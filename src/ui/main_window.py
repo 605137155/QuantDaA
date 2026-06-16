@@ -44,6 +44,15 @@ class QuantDaAMainWindow:
         self.popup_notifier = None
         self._last_auto_export_date = ""  # 自动导出日期追踪
 
+        # 首板1进2策略
+        from src.strategies.jq_auction_1to2 import JQAuction1to2Strategy
+        from pathlib import Path
+        jq_config_path = Path("config/jq_strategy_params.toml")
+        self.jq_strategy = JQAuction1to2Strategy(config_path=jq_config_path)
+        self.jq_auction_results: list = []  # 竞价匹配结果
+        self.jq_params_window = None  # 参数调整窗口
+        self.jq_fusion_window = None  # 首板断板融合策略窗口
+
         # 同花顺热门榜单数据
         self.ths_provider = THSHotProvider()
         self.ths_hourly_hot: list = []  # 24小时热榜
@@ -191,6 +200,11 @@ class QuantDaAMainWindow:
         ttk.Radiobutton(rank_row2, text="盘中候选", value="intraday_candidate", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
             side="left", padx=4
         )
+        ttk.Radiobutton(rank_row2, text="竞价1进2", value="jq_auction_1to2", variable=self.rank_mode, command=self._refresh_hot_tree).pack(
+            side="left", padx=4
+        )
+        ttk.Button(rank_row2, text="参数调整", command=self._open_jq_params_window).pack(side="left", padx=(8, 0))
+        ttk.Button(rank_row2, text="首板断板融合", command=self._open_jq_fusion_window).pack(side="left", padx=(4, 0))
 
         review_row = tk.Frame(rank_bar, bg="#ffffff")
         review_row.grid(row=2, column=1, sticky="w", padx=(12, 0), pady=(6, 0))
@@ -407,6 +421,11 @@ class QuantDaAMainWindow:
             self._intraday_candidate_job = None
             print("[Schedule] 盘中候选自动刷新已禁用（配置 enable_intraday_candidate_auto_refresh = false）")
 
+        # 启动时自动打开首板断板融合窗口
+        enable_auto_open_fusion = self.app_runner.settings.get("app", {}).get("enable_auto_open_fusion_window", True)
+        if enable_auto_open_fusion:
+            self.root.after(1000, self._open_jq_fusion_window)
+
     def _dispatch_background(self, func, on_success=None, on_error=None, task_key: str = "") -> bool:
         dispatcher = getattr(self, "_background_dispatcher", None)
         if dispatcher is None:
@@ -602,6 +621,11 @@ class QuantDaAMainWindow:
             self._refresh_candidate_tree_async(mode, current, review_enabled)
             return
 
+        # 竞价1进2模式
+        if mode == "jq_auction_1to2":
+            self._refresh_jq_auction_tree(current)
+            return
+
         # 其他模式直接在主线程执行（数据已经在内存中）
         if mode == "ths_hourly":
             self.monitor_rows = self.ths_hourly_hot
@@ -653,6 +677,71 @@ class QuantDaAMainWindow:
 
         self._dispatch_background(work, on_success=on_success, on_error=on_error, task_key="candidate_refresh")
 
+    def _refresh_jq_auction_tree(self, current: str) -> None:
+        """刷新竞价1进2排行榜"""
+        # 更新列定义
+        self.hot_tree.heading("rank", text="排名")
+        self.hot_tree.heading("code", text="代码")
+        self.hot_tree.heading("name", text="名称")
+        self.hot_tree.heading("pct", text="竞价涨幅")
+        self.hot_tree.heading("amount", text="竞昨比/成交额/命中条件")
+        self.hot_tree.column("amount", width=300, anchor="center")
+
+        # 清空现有数据
+        self.hot_tree.delete(*self.hot_tree.get_children())
+
+        # 显示竞价匹配结果
+        for idx, result in enumerate(self.jq_auction_results, start=1):
+            amount_text = f"{result.auction_vol_ratio:.2f}% / {result.yesterday_money/1e8:.1f}亿 / {result.matched_condition}"
+            pct_text = f"{result.auction_pct:.2f}%"
+            item_id = self.hot_tree.insert(
+                "",
+                "end",
+                values=(idx, result.code, result.name, pct_text, amount_text),
+                tags=(),
+            )
+            if result.code == current:
+                self.hot_tree.selection_set(item_id)
+                self.hot_tree.see(item_id)
+
+        # 更新状态
+        self._update_status(f"竞价1进2: {len(self.jq_auction_results)}只股票命中条件")
+
+    def _open_jq_params_window(self) -> None:
+        """打开竞价1进2参数调整窗口"""
+        from src.ui.jq_params_window import JQParamsWindow
+        from pathlib import Path
+
+        if self.jq_params_window is not None and self.jq_params_window.window is not None and self.jq_params_window.window.winfo_exists():
+            self.jq_params_window.window.lift()
+            return
+
+        config_path = Path("config/jq_strategy_params.toml")
+
+        def on_save(new_params):
+            self.jq_strategy.params = new_params
+            print("[JQ策略] 参数已更新")
+
+        self.jq_params_window = JQParamsWindow(
+            parent=self.root,
+            params=self.jq_strategy.params,
+            config_path=config_path,
+            on_save=on_save,
+        )
+        self.jq_params_window.show()
+
+    def _open_jq_fusion_window(self) -> None:
+        """打开首板断板融合竞价策略选股窗口"""
+        from src.ui.jq_fusion_window import JQFusionWindow
+
+        if self.jq_fusion_window is not None and self.jq_fusion_window.window is not None and self.jq_fusion_window.window.winfo_exists():
+            self.jq_fusion_window.window.lift()
+            return
+
+        self.jq_fusion_window = JQFusionWindow(parent=self.root)
+        review_date = getattr(self, 'review_trade_date', '')
+        self.jq_fusion_window.show(date_str=review_date if review_date else None)
+
     def _update_hot_tree_display(self, current: str) -> None:
         """更新排行榜显示（在主线程执行）"""
         mode = self.rank_mode.get()
@@ -670,6 +759,9 @@ class QuantDaAMainWindow:
                 amount_text = f"热度:{row.rate:.0f}"
                 pct_text = f"{row.rise_and_fall:.2f}"
                 item_id = self.hot_tree.insert("", "end", values=(idx, row.code, row.name, pct_text, amount_text), tags=())
+            elif mode == "jq_auction_1to2":
+                # 竞价1进2模式不使用monitor_rows，直接返回
+                return
             else:
                 amount_text = f"{row.amount / 100000000:.2f}亿"
                 item_id = self.hot_tree.insert("", "end", values=(idx, row.code, row.name, f"{row.pct_chg:.2f}", amount_text), tags=())
@@ -813,6 +905,16 @@ class QuantDaAMainWindow:
             self.hot_tree.column("amount", width=225 if review_enabled else 180, anchor="center")
             return
 
+        if mode == "jq_auction_1to2":
+            self.hot_tree.heading("pct", text="竞价涨幅")
+            self.hot_tree.heading("amount", text="竞昨比/成交额/命中条件")
+            self.hot_tree.column("rank", width=45, anchor="center")
+            self.hot_tree.column("code", width=85, anchor="center")
+            self.hot_tree.column("name", width=100, anchor="center")
+            self.hot_tree.column("pct", width=85, anchor="center")
+            self.hot_tree.column("amount", width=300, anchor="center")
+            return
+
         self.hot_tree.heading("pct", text="涨幅%")
         self.hot_tree.heading("amount", text="成交额")
         self.hot_tree.column("rank", width=45, anchor="center")
@@ -929,6 +1031,10 @@ class QuantDaAMainWindow:
             self.review_date_combo.configure(state="readonly" if dates else "normal")
             self.review_date_combo["values"] = dates
             return
+        if mode == "jq_auction_1to2":
+            self.review_date_combo["values"] = []
+            self.review_date_combo.configure(state="disabled")
+            return
 
         self.review_date_combo["values"] = []
         self.review_date_combo.configure(state="disabled")
@@ -969,6 +1075,18 @@ class QuantDaAMainWindow:
         selected = self.hot_tree.selection()
         if selected:
             code = self.hot_tree.item(selected[0], "values")[1]
+            # 竞价1进2模式下，更新候选映射
+            if self.rank_mode.get() == "jq_auction_1to2":
+                result = next((r for r in self.jq_auction_results if r.code == code), None)
+                if result:
+                    self.current_candidate_map[code] = {
+                        "stock_code": result.code,
+                        "stock_name": result.name,
+                        "total_score": 0,
+                        "grade": result.matched_condition,
+                        "flags": [f"竞价涨幅{result.auction_pct:.2f}%", f"竞昨比{result.auction_vol_ratio:.2f}%"],
+                        "risks": [],
+                    }
             self._select_stock(code)
 
     def _on_hot_tree_hover(self, event) -> None:
@@ -1213,9 +1331,10 @@ class QuantDaAMainWindow:
             "ths_value": "同花顺价值投资",
             "replay_candidate": "复盘候选",
             "intraday_candidate": "盘中候选",
+            "jq_auction_1to2": "竞价1进2",
         }.get(self.rank_mode.get(), self.rank_mode.get())
 
-        current_count = len(self.monitor_rows)
+        current_count = len(self.monitor_rows) if self.rank_mode.get() != "jq_auction_1to2" else len(self.jq_auction_results)
         suffix = f" | 数据源: {self.app_runner.provider_name} ({mode}) | 当前排行: {rank_mode_text} ({current_count}只)"
         if self.review_trade_date and self.rank_mode.get() in ("replay_candidate", "intraday_candidate"):
             suffix += f" | 回看日期: {self.review_trade_date}"
